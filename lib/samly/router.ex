@@ -12,20 +12,12 @@ defmodule Samly.Router do
   forward("/csp-report", to: Samly.CsprRouter)
 
   match _ do
-    conn |> send_resp(404, "not_found")
+    send_resp(conn, 404, "not_found")
   end
-
-  @csp """
-       default-src 'none';
-       script-src 'self' 'nonce-<%= nonce %>' 'report-sample';
-       img-src 'self' 'report-sample';
-       report-to /sso/csp-report;
-       """
-       |> String.replace("\n", " ")
 
   defp secure_samly(conn, _opts) do
     conn
-    |> put_private(:samly_nonce, :crypto.strong_rand_bytes(18) |> Base.encode64())
+    |> put_private(:samly_nonce, 18 |> :crypto.strong_rand_bytes() |> Base.encode64())
     |> register_before_send(fn connection ->
       nonce = connection.private[:samly_nonce]
 
@@ -33,9 +25,41 @@ defmodule Samly.Router do
       |> put_resp_header("cache-control", "no-cache, no-store, must-revalidate")
       |> put_resp_header("pragma", "no-cache")
       |> put_resp_header("x-frame-options", "SAMEORIGIN")
-      |> put_resp_header("content-security-policy", EEx.eval_string(@csp, nonce: nonce))
-      |> put_resp_header("x-xss-protection", "1; mode=block")
+      |> put_resp_header("content-security-policy", content_security_policy(connection, nonce))
       |> put_resp_header("x-content-type-options", "nosniff")
+      |> put_resp_header("referrer-policy", "no-referrer")
     end)
+  end
+
+  defp content_security_policy(conn, nonce) do
+    form_origins =
+      case conn.private[:samly_idp] do
+        %Samly.IdpData{} = idp ->
+          [idp.sso_redirect_url, idp.sso_post_url, idp.slo_redirect_url, idp.slo_post_url]
+          |> Enum.flat_map(&origin/1)
+          |> Enum.uniq()
+          |> Enum.join(" ")
+
+        _ ->
+          ""
+      end
+
+    "default-src 'none'; script-src 'nonce-#{nonce}'; form-action 'self' #{form_origins}; " <>
+      "frame-ancestors 'self'; base-uri 'none'; object-src 'none'; report-uri /sso/csp-report;"
+  end
+
+  defp origin(nil), do: []
+
+  defp origin(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host, port: port}
+      when scheme in ["http", "https"] and is_binary(host) ->
+        default_port = if scheme == "https", do: 443, else: 80
+        suffix = if port in [nil, default_port], do: "", else: ":#{port}"
+        ["#{scheme}://#{host}#{suffix}"]
+
+      _ ->
+        []
+    end
   end
 end

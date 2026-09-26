@@ -1,5 +1,12 @@
 defmodule Samly.State do
-  @moduledoc false
+  @moduledoc """
+  Dispatches authenticated assertion storage to the configured store.
+
+  Configure `:store` and `:opts` under `config :samly, Samly.State`.
+  `Samly.Provider` initializes the store; this is separate from browser session
+  middleware and from the one-time-use protection in `Samly.ReplayCache`.
+  Custom stores implement `Samly.State.Store`.
+  """
 
   @state_store :state_store
 
@@ -25,7 +32,7 @@ defmodule Samly.State do
     store_provider.delete_assertion(conn, assertion_key, opts)
   end
 
-  def gen_id() do
+  def gen_id do
     24 |> :crypto.strong_rand_bytes() |> Base.url_encode64()
   end
 end

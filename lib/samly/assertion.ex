@@ -12,8 +12,10 @@ defmodule Samly.Assertion do
   it will check in `attributes` next.
   """
 
-  require Samly.Esaml
-  alias Samly.{Esaml, Subject}
+  alias Samly.Esaml
+  alias Samly.Subject
+
+  require Esaml
 
   @type attr_name_t :: String.t()
   @type attr_value_t :: String.t() | [String.t()]
@@ -61,15 +63,14 @@ defmodule Samly.Assertion do
       recipient: List.to_string(recipient),
       issuer: List.to_string(issuer),
       subject: Subject.from_rec(subject_rec),
-      conditions: conditions |> stringize(),
-      attributes: attributes |> stringize(),
-      authn: authn |> stringize()
+      conditions: stringize(conditions),
+      attributes: stringize(attributes),
+      authn: stringize(authn)
     }
   end
 
   defp stringize(proplist) do
-    proplist
-    |> Enum.map(fn
+    Map.new(proplist, fn
       {k, []} ->
         {to_string(k), ""}
 
@@ -79,6 +80,5 @@ defmodule Samly.Assertion do
       {k, v} when is_list(v) ->
         {to_string(k), List.to_string(v)}
     end)
-    |> Enum.into(%{})
   end
 end

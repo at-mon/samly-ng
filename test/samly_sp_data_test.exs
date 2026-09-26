@@ -1,5 +1,6 @@
 defmodule SamlySpDataTest do
   use ExUnit.Case
+
   alias Samly.SpData
 
   @sp_config1 %{
@@ -50,7 +51,6 @@ defmodule SamlySpDataTest do
     refute sp_data.valid?
   end
 
-  @tag :skip
   test "invalid-sp-config-5" do
     sp_config = %{@sp_config1 | keyfile: "test/data/test.crt"}
     %SpData{} = sp_data = SpData.load_provider(sp_config)

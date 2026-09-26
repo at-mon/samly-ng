@@ -1,7 +1,11 @@
 defmodule SamlyIdpDataTest do
   use ExUnit.Case
-  require Samly.Esaml
-  alias Samly.{Esaml, IdpData, SpData}
+
+  alias Samly.Esaml
+  alias Samly.IdpData
+  alias Samly.SpData
+
+  require Esaml
 
   @sp_config1 %{
     id: "sp1",
@@ -58,16 +62,7 @@ defmodule SamlyIdpDataTest do
     sp_data4 = SpData.load_provider(@sp_config4)
     sp_data5 = SpData.load_provider(@sp_config5)
 
-    [
-      sps: %{
-        sp_data1.id => sp_data1,
-        sp_data2.id => sp_data2,
-        sp_data3.id => sp_data3,
-        sp_data4.id => sp_data4,
-        sp_data5.id => sp_data5
-      }
-    ]
-    |> Enum.into(context)
+    Enum.into([sps: %{sp_data1.id => sp_data1, sp_data2.id => sp_data2, sp_data3.id => sp_data3, sp_data4.id => sp_data4, sp_data5.id => sp_data5}], context)
   end
 
   test "valid-idp-config-1", %{sps: sps} do
@@ -208,7 +203,6 @@ defmodule SamlyIdpDataTest do
     assert entity_id == :undefined
   end
 
-  @tag :skip
   test "invalid-idp-config-1", %{sps: sps} do
     idp_config = %{@idp_config1 | id: ""}
     %IdpData{} = idp_data = IdpData.load_provider(idp_config, sps)
@@ -278,9 +272,7 @@ defmodule SamlyIdpDataTest do
 
   test "nameid-format-in-metadata-and-config-should-use-config", %{sps: sps} do
     idp_config =
-      Map.merge(@idp_config1, %{
-        nameid_format: :persistent
-      })
+      Map.put(@idp_config1, :nameid_format, :persistent)
 
     %IdpData{} = idp_data = IdpData.load_provider(idp_config, sps)
     assert idp_data.nameid_format == ~c"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
@@ -288,9 +280,7 @@ defmodule SamlyIdpDataTest do
 
   test "nameid-format-in-neither-metadata-nor-config-should-be-unknown", %{sps: sps} do
     idp_config =
-      Map.merge(@idp_config1, %{
-        metadata_file: "test/data/shibboleth_idp_metadata.xml"
-      })
+      Map.put(@idp_config1, :metadata_file, "test/data/shibboleth_idp_metadata.xml")
 
     %IdpData{} = idp_data = IdpData.load_provider(idp_config, sps)
     assert idp_data.nameid_format == :unknown

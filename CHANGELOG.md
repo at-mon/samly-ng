@@ -1,5 +1,55 @@
 # CHANGELOG
 
+### v2.0.0 - 2026-09-27
+
+Major release.
+Samly now ships a native Elixir SAML core and drops the external esaml/SweetXml stack.
+See [MIGRATION.md](docs/MIGRATION.md) for upgrade steps and [SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) for the security assessment.
+
+#### ⚠️ Breaking
+
++   ✨ feat!: Replaced the esaml and SweetXml stack with a native Elixir SAML core built on `saxy` and `xml_builder`.
++   ✨ feat!: Requires Elixir 1.20 and supports OTP 27 through OTP 29.
++   ✨ feat!: Removed `cowboy`, `ranch`, and `cowlib` as transitive dependencies; Samly no longer selects or starts an HTTP server, so servers such as Bandit work without a Cowboy compatibility shim.
++   🔒 security: XML signatures require SHA-256 or stronger by default; SHA-1 is only accepted per-IdP via `allow_legacy_sha1: true` and should stay disabled for IdPs that support SHA-256.
++   🔒 security: Encrypted assertions require RSA-OAEP and AES-GCM; legacy RSA PKCS#1 v1.5 and AES-CBC encryption are rejected.
++   🔒 security: Request-controlled redirect targets must be site-relative paths; protocol-relative, control-character, and absolute URLs are rejected unless they exactly match the IdP's `allowed_target_urls`.
++   🔒 security: Relative `base_url` configurations must set an absolute `:external_base_url` or list the request host under `:trusted_hosts`, preventing a forged Host header from changing generated SAML endpoints.
++   🔒 security: SP-initiated responses must match both RelayState and the original SAML request ID.
++   🪄 refactor: New applications should add `Samly.Plug` after their body parsers and before the application router; the existing `forward "/", Samly.Router` integration remains available.
+
+#### 💡 Added
+
++   💡 feat: `Samly.get_nameid/1` returns the NameID from an assertion when the NameID itself is the required subject identifier.
++   💡 feat: `Samly.IdpData.from_config/2` builds an IdP at runtime, and the `Samly.ConfigProvider` behaviour (configured under `:config_provider`) enables tenant-specific resolution.
++   💡 feat: `custom_consume_uri` and `custom_logout_uri` config for IdPs with fixed legacy endpoint registrations.
++   💡 feat: `force_authn: true` config to require the IdP to reauthenticate the user.
++   💡 feat: `post_session_cleanup_pipeline` for logout cleanup and a two-argument `on_logout` logout callback.
++   🔒 security: `Samly.ReplayCache` makes response and assertion IDs single-use; configure a cluster-wide implementation for multi-node deployments.
++   🔒 security: XML input hardening rejects DTD/entity declarations before parsing, bounds decoded and inflated payload sizes, and limits element count and nesting depth.
++   🧪 tests: Added security, ingress-security, replay/atom, and Bandit end-to-end test suites, plus a c14n namespace-context vector cross-checked with libxml2.
++   📦 package: Added `bandit`, `stream_data`, `mix_audit`, `sobelow`, `styler`, `ex_quality`, and `credo` (dev/test only) for the quality and security gates.
+
+#### 🔒 Fixed
+
++   🔒 security: CVE-2026-28809 - external esaml/xmerl parsing is removed and XML entities and doctypes are rejected before parsing.
++   🔒 security: CVE-2026-53424 - accepted message IDs are consumed once via a supervised, bounded, fail-closed replay cache.
++   🔒 security: CVE-2026-53425 - AuthnRequest IDs are stored in the browser session and checked against signed SubjectConfirmationData so unsolicited responses cannot replace a pending SP flow.
++   🐛 fix: Debug mode no longer reflects raw SAML responses into HTML error pages.
++   🐛 fix: SP configuration and logout callback failures no longer log full configuration maps or callback exception text.
+
+#### 🪄 Changed
+
++   📦 package: Bumped `plug` from 1.15.3 to 1.20.3 (`plug_crypto` 2.2.0).
++   🪄 refactor: Rewrote SAML binding, protocol, encryption, redirect-signature, XML, and XMLDSig handling as dedicated `Samly.SAML.*` modules.
++   ⚙️ skip-ci: Added Credo, Sobelow, mix_audit, and Styler configuration and a CI quality/security gate across OTP 27/28/29 with Elixir 1.20.
+
+#### 📃 Documentation
+
++   📃 docs: Added `MIGRATION.md` upgrade guide and `SECURITY_REVIEW.md` security assessment.
++   📃 docs: Added Phoenix setup, configuration, and Microsoft Entra ID guides under `docs/`.
++   📃 docs: Rewrote `README.md` for the 2.0 native-core architecture.
+
 ### v1.4.0
 +   remove uri double encoding thanks to @DiaanEngelbrecht
 +   fix esaml initialization thanks to @bopm

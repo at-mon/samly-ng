@@ -1,6 +1,8 @@
 defmodule Samly.StateTest do
   use ExUnit.Case, async: true
-  use Plug.Test
+
+  import Plug.Conn
+  import Plug.Test
 
   describe "With Session Cache" do
     setup do
@@ -16,7 +18,8 @@ defmodule Samly.StateTest do
       Samly.State.init(Samly.State.Session)
 
       conn =
-        conn(:get, "/")
+        :get
+        |> conn("/")
         |> Plug.Session.call(opts)
         |> fetch_session()
 
@@ -24,7 +27,7 @@ defmodule Samly.StateTest do
     end
 
     test "put/get assertion", %{conn: conn} do
-      not_on_or_after = DateTime.utc_now() |> DateTime.add(8, :hour) |> DateTime.to_iso8601()
+      not_on_or_after = DateTime.utc_now() |> DateTime.shift(hour: 8) |> DateTime.to_iso8601()
       assertion = %Samly.Assertion{subject: %{notonorafter: not_on_or_after}}
       assertion_key = {"idp1", "name1"}
       conn = Samly.State.put_assertion(conn, assertion_key, assertion)
@@ -46,7 +49,7 @@ defmodule Samly.StateTest do
     end
 
     test "delete assertion", %{conn: conn} do
-      not_on_or_after = DateTime.utc_now() |> DateTime.add(8, :hour) |> DateTime.to_iso8601()
+      not_on_or_after = DateTime.utc_now() |> DateTime.shift(hour: 8) |> DateTime.to_iso8601()
       assertion = %Samly.Assertion{subject: %{notonorafter: not_on_or_after}}
       assertion_key = {"idp1", "name1"}
       conn = Samly.State.put_assertion(conn, assertion_key, assertion)
@@ -63,7 +66,7 @@ defmodule Samly.StateTest do
     end
 
     test "put/get assertion", %{conn: conn} do
-      not_on_or_after = DateTime.utc_now() |> DateTime.add(8, :hour) |> DateTime.to_iso8601()
+      not_on_or_after = DateTime.utc_now() |> DateTime.shift(hour: 8) |> DateTime.to_iso8601()
       assertion = %Samly.Assertion{subject: %{notonorafter: not_on_or_after}}
       assertion_key = {"idp1", "name1"}
       conn = Samly.State.put_assertion(conn, assertion_key, assertion)
@@ -85,7 +88,7 @@ defmodule Samly.StateTest do
     end
 
     test "delete assertion", %{conn: conn} do
-      not_on_or_after = DateTime.utc_now() |> DateTime.add(8, :hour) |> DateTime.to_iso8601()
+      not_on_or_after = DateTime.utc_now() |> DateTime.shift(hour: 8) |> DateTime.to_iso8601()
       assertion = %Samly.Assertion{subject: %{notonorafter: not_on_or_after}}
       assertion_key = {"idp1", "name1"}
       conn = Samly.State.put_assertion(conn, assertion_key, assertion)

@@ -4,7 +4,8 @@ defmodule Samly do
   """
 
   alias Plug.Conn
-  alias Samly.{Assertion, State}
+  alias Samly.Assertion
+  alias Samly.State
 
   @doc """
   Returns authenticated user SAML Assertion.
@@ -59,4 +60,9 @@ defmodule Samly do
   def get_attribute(%Assertion{} = assertion, name) do
     Map.get(assertion.computed, name) || Map.get(assertion.attributes, name)
   end
+
+  @doc "Returns the NameID from an assertion, or `nil` when no assertion is present."
+  @spec get_nameid(nil | Assertion.t()) :: nil | binary()
+  def get_nameid(nil), do: nil
+  def get_nameid(%Assertion{subject: %{name: name}}), do: name
 end

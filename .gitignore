@@ -1,23 +1,56 @@
+### editor
+.idea
+*.swp
+**/.vscode/
+**/.lens/
+**/.aider*
+**/.elixir_ls
+**/.expert
+**/.dexter/
+**/.dexter.*
+**/.art/
+.claude
+.codex
+.agents
+.cursor
+**/worktrees
+
+# OS
+*.swp
+*~
+**/.DS_Store
+.DS_Store
+.history
+
 # The directory Mix will write compiled artifacts to.
-/_build/
-
+**/_build/
+# The directory Mix will release artifacts to.
+# **/rel/
 # If you run "mix test --cover", coverage assets end up here.
-/cover/
-
+**/cover/
 # The directory Mix downloads your dependencies sources to.
-/deps/
-
+**/deps/
 # Where 3rd-party dependencies like ExDoc output generated docs.
-/doc/
-
+**/doc/
 # Ignore .fetch files in case you like to edit your project deps locally.
-/.fetch
-
+**/.fetch
 # If the VM crashes, it generates a dump, let's ignore it too.
-erl_crash.dump
-
+**/erl_crash.dump
+**/*.ez
+**/*.beam
 # Also ignore archive artifacts (built via "mix archive.build").
-*.ez
-.sobelow
-/docs/
-/.elixir_ls/
+**/*.ez
+# If NPM crashes, it generates a log, let's ignore it too.# Dialyzer
+**/priv/static/
+**/priv/plts/*.plt*
+# Sobelow
+**/.sobelow
+
+### Protect local files
+envs/*
+.env
+**/.env
+*.local
+*.local.*
+/local
+/tmp/

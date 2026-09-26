@@ -1,14 +1,23 @@
 defmodule Samly.SPHandler do
   @moduledoc false
 
-  require Logger
   import Plug.Conn
+  import Samly.RouterUtil, only: [ensure_sp_uris_set: 2, send_saml_request: 6, redirect: 3]
+
   alias Plug.Conn
-  require Samly.Esaml
-  alias Samly.{Assertion, Esaml, Helper, IdpData, State, Subject}
+  alias Samly.Assertion
+  alias Samly.Esaml
+  alias Samly.Helper
+  alias Samly.IdpData
+  alias Samly.SAML.RedirectSignature
+  alias Samly.State
+  alias Samly.Subject
 
-  import Samly.RouterUtil, only: [ensure_sp_uris_set: 2, send_saml_request: 5, redirect: 3]
+  require Esaml
+  require Logger
 
+  # XMLBuilder escapes metadata; the response is XML, not HTML.
+  # sobelow_skip ["XSS.SendResp"]
   def send_metadata(conn) do
     %IdpData{} = idp = conn.private[:samly_idp]
     %IdpData{esaml_idp_rec: _idp_rec, esaml_sp_rec: sp_rec} = idp
@@ -32,16 +41,17 @@ defmodule Samly.SPHandler do
 
     saml_encoding = conn.body_params["SAMLEncoding"]
     saml_response = conn.body_params["SAMLResponse"]
-    relay_state = conn.body_params["RelayState"] |> safe_decode_www_form()
+    relay_state = safe_decode_www_form(conn.body_params["RelayState"])
 
-    with {:ok, assertion} <- Helper.decode_idp_auth_resp(sp, saml_encoding, saml_response),
+    with {:ok, %Assertion{} = assertion} <-
+           Helper.decode_idp_auth_resp(sp, saml_encoding, saml_response),
          :ok <- validate_authresp(conn, assertion, relay_state),
-         assertion = %Assertion{assertion | idp_id: idp_id},
-         conn = conn |> put_private(:samly_assertion, assertion),
+         assertion = %{assertion | idp_id: idp_id},
+         conn = put_private(conn, :samly_assertion, assertion),
          {:halted, %Conn{halted: false} = conn} <- {:halted, pipethrough(conn, pipeline)} do
       updated_assertion = conn.private[:samly_assertion]
       computed = updated_assertion.computed
-      assertion = %Assertion{assertion | computed: computed, idp_id: idp_id}
+      assertion = %{assertion | computed: computed, idp_id: idp_id}
 
       nameid = assertion.subject.name
       assertion_key = {idp_id, nameid}
@@ -51,19 +61,21 @@ defmodule Samly.SPHandler do
       conn
       |> configure_session(renew: true)
       |> put_session("samly_assertion_key", assertion_key)
+      |> delete_session("relay_state")
+      |> delete_session("idp_id")
+      |> delete_session("target_url")
+      |> delete_session("req_id")
       |> redirect(302, target_url)
     else
-      {:halted, conn} -> conn
+      {:halted, conn} ->
+        conn
+
       {:error, reason} ->
-        case idp do
-          %IdpData{debug_mode: true} ->
-            conn
-            |> put_resp_header("content-type", "text/html")
-            |> send_resp(403, "<html><body><div><h1>access_denied</h1><p><b>Error:</b><br /><pre><code>#{inspect(reason)}</code></pre></p><p><b>Raw Response:</b><br /><pre><code>#{saml_response}</code></pre></p></div></body></html")
-          _ ->
-            conn |> send_resp(403, "access_denied #{inspect(reason)}")
-        end
-      _ -> conn |> send_resp(403, "access_denied")
+        Logger.warning("[Samly] SAML response rejected for #{idp.id}: #{inspect(reason)}")
+        send_resp(conn, 403, "access_denied")
+
+      _ ->
+        send_resp(conn, 403, "access_denied")
     end
 
     # rescue
@@ -77,30 +89,25 @@ defmodule Samly.SPHandler do
   defp validate_authresp(conn, %{subject: %{in_response_to: ""}}, relay_state) do
     idp_data = conn.private[:samly_idp]
 
-    if idp_data.allow_idp_initiated_flow do
-      if idp_data.allowed_target_urls do
-        if relay_state in idp_data.allowed_target_urls do
-          :ok
-        else
-          {:error, :invalid_target_url}
-        end
-      else
-        :ok
-      end
-    else
-      {:error, :idp_first_flow_not_allowed}
+    cond do
+      not idp_data.allow_idp_initiated_flow -> {:error, :idp_first_flow_not_allowed}
+      get_session(conn, "req_id") != nil -> {:error, :unexpected_idp_initiated_response}
+      relay_state == "" -> :ok
+      Samly.RouterUtil.valid_target_url?(relay_state, idp_data) -> :ok
+      true -> {:error, :invalid_target_url}
     end
   end
 
   # SP-initiated flow auth response
-  defp validate_authresp(conn, _assertion, relay_state) do
+  defp validate_authresp(conn, %{subject: %{in_response_to: in_response_to}}, relay_state) do
     %IdpData{id: idp_id} = conn.private[:samly_idp]
     rs_in_session = get_session(conn, "relay_state")
     idp_id_in_session = get_session(conn, "idp_id")
     url_in_session = get_session(conn, "target_url")
+    request_id_in_session = get_session(conn, "req_id")
 
     cond do
-      rs_in_session == nil || rs_in_session != relay_state ->
+      not secure_equal?(rs_in_session, relay_state) ->
         {:error, :invalid_relay_state}
 
       idp_id_in_session == nil || idp_id_in_session != idp_id ->
@@ -108,6 +115,9 @@ defmodule Samly.SPHandler do
 
       url_in_session == nil ->
         {:error, :invalid_target_url}
+
+      request_id_in_session == nil || request_id_in_session != in_response_to ->
+        {:error, :invalid_in_response_to}
 
       true ->
         :ok
@@ -132,19 +142,31 @@ defmodule Samly.SPHandler do
     %IdpData{esaml_idp_rec: _idp_rec, esaml_sp_rec: sp_rec} = idp
     sp = ensure_sp_uris_set(sp_rec, conn)
 
-    saml_encoding = conn.body_params["SAMLEncoding"]
-    saml_response = conn.body_params["SAMLResponse"]
-    relay_state = conn.body_params["RelayState"] |> safe_decode_www_form()
+    params = request_params(conn)
+    saml_encoding = params["SAMLEncoding"]
+    saml_response = params["SAMLResponse"]
+    relay_state = safe_decode_www_form(params["RelayState"])
 
-    with {:ok, _payload} <- Helper.decode_idp_signout_resp(sp, saml_encoding, saml_response),
+    with :ok <- verify_redirect_signature(conn, idp, "SAMLResponse"),
+         {:ok, payload} <-
+           Helper.decode_idp_signout_resp(logout_decode_sp(conn, sp), saml_encoding, saml_response),
+         true <- secure_equal?(Esaml.esaml_logoutresp(payload, :in_response_to), get_session(conn, "logout_req_id")),
          ^relay_state when relay_state != nil <- get_session(conn, "relay_state"),
          ^idp_id <- get_session(conn, "idp_id"),
          target_url when target_url != nil <- get_session(conn, "target_url") do
-      conn
-      |> configure_session(drop: true)
-      |> redirect(302, target_url)
+      case pipethrough(configure_session(conn, drop: true), idp.post_session_cleanup_pipeline) do
+        %Conn{halted: true} = halted_conn ->
+          halted_conn
+
+        pipeline_conn ->
+          pipeline_conn
+          |> configure_session(drop: true)
+          |> redirect(302, target_url)
+      end
     else
-      error -> conn |> send_resp(403, "invalid_request #{inspect(error)}")
+      _error ->
+        Logger.warning("[Samly] Logout response rejected")
+        send_resp(conn, 403, "invalid_request")
     end
 
     # rescue
@@ -159,41 +181,45 @@ defmodule Samly.SPHandler do
     %IdpData{esaml_idp_rec: idp_rec, esaml_sp_rec: sp_rec} = idp
     sp = ensure_sp_uris_set(sp_rec, conn)
 
-    saml_encoding = conn.body_params["SAMLEncoding"]
-    saml_request = conn.body_params["SAMLRequest"]
-    relay_state = conn.body_params["RelayState"] |> safe_decode_www_form()
+    params = request_params(conn)
+    saml_encoding = params["SAMLEncoding"]
+    saml_request = params["SAMLRequest"]
+    relay_state = safe_decode_www_form(params["RelayState"])
 
-    with {:ok, payload} <- Helper.decode_idp_signout_req(sp, saml_encoding, saml_request) do
-      Esaml.esaml_logoutreq(name: nameid, issuer: _issuer) = payload
+    with :ok <- verify_redirect_signature(conn, idp, "SAMLRequest"),
+         {:ok, payload} <-
+           Helper.decode_idp_signout_req(logout_decode_sp(conn, sp), saml_encoding, saml_request) do
+      Esaml.esaml_logoutreq(name: nameid, issuer: _issuer, id: request_id) = payload
+      nameid = to_string(nameid)
       assertion_key = {idp_id, nameid}
 
       {conn, return_status} =
         case State.get_assertion(conn, assertion_key) do
-          %Assertion{idp_id: ^idp_id, subject: %Subject{name: ^nameid}} ->
-            conn = State.delete_assertion(conn, assertion_key)
-            {conn, :success}
+          %Assertion{idp_id: ^idp_id, subject: %Subject{name: ^nameid}} = assertion ->
+            if matching_logout_session?(payload, assertion) do
+              run_logout_callback(idp.on_logout, idp_id, assertion)
+              conn = State.delete_assertion(conn, assertion_key)
+              {conn, :success}
+            else
+              {conn, :denied}
+            end
 
           _ ->
             {conn, :denied}
         end
 
-      {idp_signout_url, resp_xml_frag} = Helper.gen_idp_signout_resp(sp, idp_rec, return_status)
+      {idp_signout_url, resp_xml_frag} = Helper.gen_idp_signout_resp(sp, idp_rec, return_status, request_id)
+      conn = cleanup_logout_conn(conn, assertion_key, idp.post_session_cleanup_pipeline, return_status)
 
-      conn
-      |> configure_session(drop: true)
-      |> send_saml_request(idp_signout_url, idp.use_redirect_for_req, resp_xml_frag, relay_state)
-    else
-      error ->
-        Logger.error("#{inspect(error)}")
-        {idp_signout_url, resp_xml_frag} = Helper.gen_idp_signout_resp(sp, idp_rec, :denied)
-
+      if conn.halted do
         conn
-        |> send_saml_request(
-          idp_signout_url,
-          idp.use_redirect_for_req,
-          resp_xml_frag,
-          relay_state
-        )
+      else
+        send_saml_request(conn, idp_signout_url, idp.use_redirect_for_req, resp_xml_frag, relay_state, sp)
+      end
+    else
+      _error ->
+        Logger.warning("[Samly] Logout request rejected")
+        send_resp(conn, 403, "invalid_request")
     end
 
     # rescue
@@ -202,6 +228,49 @@ defmodule Samly.SPHandler do
     #     conn |> send_resp(500, "request_failed")
   end
 
+  defp matching_logout_session?(payload, assertion) do
+    requested = payload |> Esaml.esaml_logoutreq(:session_index) |> to_string()
+    requested == "" or requested == Map.get(assertion.authn, "session_index")
+  end
+
+  defp cleanup_logout_conn(conn, assertion_key, pipeline, :success) do
+    if get_session(conn, "samly_assertion_key") == assertion_key, do: conn |> configure_session(drop: true) |> pipethrough(pipeline), else: conn
+  end
+
+  defp cleanup_logout_conn(conn, _key, _pipeline, _status), do: conn
+
   defp safe_decode_www_form(nil), do: ""
-  defp safe_decode_www_form(data), do: URI.decode_www_form(data)
+  # Plug has already form-decoded values; decoding again changes signed RelayState.
+  defp safe_decode_www_form(data) when is_binary(data), do: data
+  defp safe_decode_www_form(_data), do: nil
+
+  defp secure_equal?(left, right) when is_binary(left) and is_binary(right), do: Plug.Crypto.secure_compare(left, right)
+
+  defp secure_equal?(_left, _right), do: false
+
+  defp request_params(%Conn{method: "GET", params: params}), do: params
+  defp request_params(%Conn{body_params: params}), do: params
+
+  defp verify_redirect_signature(%Conn{method: "GET", query_string: query}, idp, type) do
+    RedirectSignature.verify(query, type, idp.certs, allow_legacy_sha1: idp.allow_legacy_sha1)
+  end
+
+  defp verify_redirect_signature(_conn, _idp, _type), do: :ok
+
+  defp logout_decode_sp(%Conn{method: "GET"}, sp) do
+    Esaml.esaml_sp(sp, idp_signs_logout_requests: false)
+  end
+
+  defp logout_decode_sp(_conn, sp), do: Esaml.esaml_sp(sp, idp_signs_logout_requests: true)
+
+  defp run_logout_callback(nil, _idp_id, _assertion), do: :ok
+
+  defp run_logout_callback(callback, idp_id, assertion) do
+    callback.(idp_id, assertion)
+    :ok
+  rescue
+    _error ->
+      Logger.error("[Samly] on_logout callback failed")
+      :ok
+  end
 end

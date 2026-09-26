@@ -1,9 +1,10 @@
 defmodule Samly.SpData do
   @moduledoc false
 
-  require Logger
-  require Samly.Esaml
+  alias Samly.SAML.Key
   alias Samly.SpData
+
+  require Logger
 
   defstruct id: "",
             entity_id: "",
@@ -46,11 +47,10 @@ defmodule Samly.SpData do
     prov_configs
     |> Enum.map(&load_provider/1)
     |> Enum.filter(fn sp_data -> sp_data.valid? end)
-    |> Enum.map(fn sp_data -> {sp_data.id, sp_data} end)
-    |> Enum.into(%{})
+    |> Map.new(fn sp_data -> {sp_data.id, sp_data} end)
   end
 
-  @spec load_provider(map) :: %SpData{} | no_return
+  @spec load_provider(map) :: t() | no_return
   def load_provider(%{} = opts_map) do
     %__MODULE__{
       id: Map.get(opts_map, :id, ""),
@@ -68,50 +68,48 @@ defmodule Samly.SpData do
     |> load_key(opts_map)
   end
 
-  @spec set_id(%SpData{}, map()) :: %SpData{}
+  @spec set_id(t(), map()) :: t()
   defp set_id(%SpData{} = sp_data, %{} = opts_map) do
     case Map.get(opts_map, :id, "") do
       "" ->
-        Logger.error("[Samly] Invalid SP Config: #{inspect(opts_map)}")
-        %SpData{sp_data | valid?: false}
+        Logger.error("[Samly] Invalid SP Config: missing id")
+        %{sp_data | valid?: false}
 
       id ->
-        %SpData{sp_data | id: id}
+        %{sp_data | id: id}
     end
   end
 
-  @spec load_cert(%SpData{}, map()) :: %SpData{}
+  @spec load_cert(t(), map()) :: t()
   defp load_cert(%SpData{certfile: ""} = sp_data, _) do
-    %SpData{sp_data | cert: :undefined}
+    %{sp_data | cert: :undefined}
   end
 
-  defp load_cert(%SpData{certfile: certfile} = sp_data, %{} = opts_map) do
-    try do
-      cert = :esaml_util.load_certificate(certfile)
-      %SpData{sp_data | cert: cert}
-    rescue
-      _error ->
-        Logger.error(
-          "[Samly] Failed load SP certfile [#{inspect(certfile)}]: #{inspect(opts_map)}"
-        )
+  defp load_cert(%SpData{certfile: certfile} = sp_data, %{}) do
+    case Key.load_certificate(certfile) do
+      {:ok, cert} ->
+        %{sp_data | cert: cert}
 
-        %SpData{sp_data | valid?: false}
+      {:error, _reason} ->
+        Logger.error("[Samly] Failed to load SP certificate")
+
+        %{sp_data | valid?: false}
     end
   end
 
-  @spec load_key(%SpData{}, map()) :: %SpData{}
+  @spec load_key(t(), map()) :: t()
   defp load_key(%SpData{keyfile: ""} = sp_data, _) do
-    %SpData{sp_data | key: :undefined}
+    %{sp_data | key: :undefined}
   end
 
-  defp load_key(%SpData{keyfile: keyfile} = sp_data, %{} = opts_map) do
-    try do
-      key = :esaml_util.load_private_key(keyfile)
-      %SpData{sp_data | key: key}
-    rescue
-      _error ->
-        Logger.error("[Samly] Failed load SP keyfile [#{inspect(keyfile)}]: #{inspect(opts_map)}")
-        %SpData{sp_data | key: :undefined, valid?: false}
+  defp load_key(%SpData{keyfile: keyfile} = sp_data, %{}) do
+    case Key.load_private_key(keyfile) do
+      {:ok, key} ->
+        %{sp_data | key: key}
+
+      {:error, _reason} ->
+        Logger.error("[Samly] Failed to load SP private key")
+        %{sp_data | key: :undefined, valid?: false}
     end
   end
 end

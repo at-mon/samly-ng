@@ -17,19 +17,20 @@ defmodule Samly.State.Session do
         opts: [key: :my_assertion]
   """
 
+  @behaviour Samly.State.Store
+
   alias Plug.Conn
   alias Samly.Assertion
-
-  @behaviour Samly.State.Store
+  alias Samly.State.Store
 
   @session_key "samly_assertion"
 
-  @impl Samly.State.Store
+  @impl Store
   def init(opts) do
     opts |> Map.new() |> Map.put_new(:key, @session_key)
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def get_assertion(conn, assertion_key, opts) do
     %{key: key} = opts
 
@@ -39,26 +40,24 @@ defmodule Samly.State.Session do
     end
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def put_assertion(conn, assertion_key, assertion, opts) do
     %{key: key} = opts
     Conn.put_session(conn, key, {assertion_key, assertion})
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def delete_assertion(conn, _assertion_key, opts) do
     %{key: key} = opts
     Conn.delete_session(conn, key)
   end
 
-  defp validate_assertion_expiry(
-         %Assertion{subject: %{notonorafter: not_on_or_after}} = assertion
-       ) do
+  defp validate_assertion_expiry(%Assertion{subject: %{notonorafter: not_on_or_after}} = assertion) do
     now = DateTime.utc_now()
 
     case DateTime.from_iso8601(not_on_or_after) do
       {:ok, not_on_or_after, _} ->
-        if DateTime.compare(now, not_on_or_after) == :lt, do: assertion, else: nil
+        if DateTime.before?(now, not_on_or_after), do: assertion
 
       _ ->
         nil

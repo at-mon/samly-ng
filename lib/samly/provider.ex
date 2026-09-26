@@ -11,18 +11,19 @@ defmodule Samly.Provider do
 
     children = [
       # ...
-      worker(Samly.Provider, []),
+      {Samly.Provider, []},
     ]
   ```
 
-  Check README.md `Configuration` section.
+  See the [Phoenix setup guide](phoenix_setup.html) and
+  [configuration reference](configuration.html).
   """
 
   use GenServer
-  require Logger
 
-  require Samly.Esaml
-  alias Samly.{State}
+  alias Samly.State
+
+  require Logger
 
   @doc false
   def start_link(gs_opts \\ []) do
@@ -31,7 +32,7 @@ defmodule Samly.Provider do
 
   @doc false
   def init([]) do
-    store_env = Application.get_env(:samly, Samly.State, [])
+    store_env = Application.get_env(:samly, State, [])
     store_provider = store_env[:store] || Samly.State.ETS
     store_opts = store_env[:opts] || []
     State.init(store_provider, store_opts)
@@ -48,16 +49,12 @@ defmodule Samly.Provider do
           value
 
         unknown ->
-          Logger.warning(
-            "[Samly] invalid_data idp_id_from: #{inspect(unknown)}. Using :path_segment"
-          )
+          Logger.warning("[Samly] invalid_data idp_id_from: #{inspect(unknown)}. Using :path_segment")
 
           :path_segment
       end
 
     Application.put_env(:samly, :idp_id_from, idp_id_from)
-    :esaml_util.start_ets()
-
     refresh_providers()
   end
 

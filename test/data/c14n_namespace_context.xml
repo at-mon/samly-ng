@@ -1,0 +1,1 @@
+<a:Root xmlns:a="urn:root" xmlns="urn:default" xmlns:z="urn:last" xmlns:q="urn:unused" ID="root"><a:Child beta="2" alpha="1" z:key="tab&#x9;line&#xA;return&#xD;&quot;">A&amp;B&lt;C&gt;D&#xD;</a:Child><Default><Reset xmlns=""><z:Leaf/></Reset></Default></a:Root>

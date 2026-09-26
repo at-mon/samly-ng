@@ -15,8 +15,9 @@ defmodule Samly.Subject do
   will be an empty string in that case.
   """
 
-  require Samly.Esaml
   alias Samly.Esaml
+
+  require Esaml
 
   defstruct name: "",
             name_qualifier: :undefined,
@@ -49,13 +50,13 @@ defmodule Samly.Subject do
     ) = subject_rec
 
     %__MODULE__{
-      name: name |> List.to_string(),
+      name: List.to_string(name),
       name_qualifier: to_string_or_undefined(name_qualifier),
       sp_name_qualifier: to_string_or_undefined(sp_name_qualifier),
       name_format: to_string_or_undefined(name_format),
       confirmation_method: confirmation_method,
-      notonorafter: notonorafter |> List.to_string(),
-      in_response_to: in_response_to |> List.to_string()
+      notonorafter: List.to_string(notonorafter),
+      in_response_to: List.to_string(in_response_to)
     }
   end
 

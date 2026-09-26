@@ -22,13 +22,14 @@ defmodule Samly.State.ETS do
   redis, memcached, database etc.
   """
 
-  alias Samly.Assertion
-
   @behaviour Samly.State.Store
+
+  alias Samly.Assertion
+  alias Samly.State.Store
 
   @assertions_table :samly_assertions_table
 
-  @impl Samly.State.Store
+  @impl Store
   def init(opts) do
     assertions_table = Keyword.get(opts, :table, @assertions_table)
 
@@ -43,7 +44,7 @@ defmodule Samly.State.ETS do
     assertions_table
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def get_assertion(_conn, assertion_key, assertions_table) do
     case :ets.lookup(assertions_table, assertion_key) do
       [{^assertion_key, %Assertion{} = assertion}] -> validate_assertion_expiry(assertion)
@@ -51,26 +52,24 @@ defmodule Samly.State.ETS do
     end
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def put_assertion(conn, assertion_key, assertion, assertions_table) do
     :ets.insert(assertions_table, {assertion_key, assertion})
     conn
   end
 
-  @impl Samly.State.Store
+  @impl Store
   def delete_assertion(conn, assertion_key, assertions_table) do
     :ets.delete(assertions_table, assertion_key)
     conn
   end
 
-  defp validate_assertion_expiry(
-         %Assertion{subject: %{notonorafter: not_on_or_after}} = assertion
-       ) do
+  defp validate_assertion_expiry(%Assertion{subject: %{notonorafter: not_on_or_after}} = assertion) do
     now = DateTime.utc_now()
 
     case DateTime.from_iso8601(not_on_or_after) do
       {:ok, not_on_or_after, _} ->
-        if DateTime.compare(now, not_on_or_after) == :lt, do: assertion, else: nil
+        if DateTime.before?(now, not_on_or_after), do: assertion
 
       _ ->
         nil
