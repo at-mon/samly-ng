@@ -19,12 +19,12 @@ jobs:
       matrix:
         otp: ["27.3.4.17", "28.5.0.6", "29.1"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.20"
           otp-version: ${{ matrix.otp }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             deps
