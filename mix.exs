@@ -1,9 +1,9 @@
 defmodule Samly.Mixfile do
   use Mix.Project
 
-  @version "2.0.0"
+  @version "2.0.1"
   @description "SAML Single-Sign-On Authentication for Plug/Phoenix Applications"
-  @source_url "https://github.com/dropbox/samly"
+  @source_url "https://github.com/at-mon/samly-ng"
 
   def project do
     [
