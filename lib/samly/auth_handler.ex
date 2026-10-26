@@ -62,14 +62,7 @@ defmodule Samly.AuthHandler do
     |> send_resp(200, EEx.eval_string(@sso_init_resp_template, opts))
   end
 
-  defp html_escape(value) do
-    value
-    |> to_string()
-    |> String.replace("&", "&amp;")
-    |> String.replace("\"", "&quot;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-  end
+  defp html_escape(value), do: Samly.HTML.escape_attribute(value)
 
   def send_signin_req(conn) do
     %IdpData{id: idp_id} = idp = conn.private[:samly_idp]
@@ -77,7 +70,7 @@ defmodule Samly.AuthHandler do
     sp = ensure_sp_uris_set(sp_rec, conn)
 
     target_url = conn.private[:samly_target_url] || "/"
-    assertion_key = get_session(conn, "samly_assertion_key")
+    assertion_key = State.assertion_key(conn)
 
     case State.get_assertion(conn, assertion_key) do
       %Assertion{idp_id: ^idp_id} ->
@@ -119,10 +112,11 @@ defmodule Samly.AuthHandler do
     sp = ensure_sp_uris_set(sp_rec, conn)
 
     target_url = conn.private[:samly_target_url] || "/"
-    assertion_key = get_session(conn, "samly_assertion_key")
+    assertion_key = State.assertion_key(conn)
 
     case State.get_assertion(conn, assertion_key) do
       %Assertion{idp_id: ^idp_id, authn: authn, subject: subject} = assertion ->
+        conn = State.delete_assertion(conn, assertion_key)
         run_logout_callback(idp.on_logout, idp_id, assertion)
         session_index = Map.get(authn, "session_index", "")
         subject_rec = Subject.to_rec(subject)
@@ -132,7 +126,6 @@ defmodule Samly.AuthHandler do
 
         {:ok, logout_request_id} = Protocol.message_id(req_xml_frag)
 
-        conn = State.delete_assertion(conn, assertion_key)
         relay_state = State.gen_id()
 
         conn
@@ -141,6 +134,7 @@ defmodule Samly.AuthHandler do
         |> put_session("relay_state", relay_state)
         |> put_session("idp_id", idp_id)
         |> delete_session("samly_assertion_key")
+        |> delete_session("samly_session")
         |> send_saml_request(
           idp_signout_url,
           idp.use_redirect_for_req,

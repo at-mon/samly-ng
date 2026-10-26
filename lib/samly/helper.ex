@@ -81,20 +81,32 @@ defmodule Samly.Helper do
       {:ok, assertion}
     else
       {:error, reason} -> {:error, reason}
-      error -> {:error, {:invalid_request, "#{inspect(error)}"}}
+      _error -> {:error, :invalid_request}
     end
   end
 
-  def decode_idp_signout_resp(sp, saml_encoding, saml_response) do
+  def verify_idp_auth_resp(sp, saml_encoding, saml_response) do
+    with {:ok, xml} <- decode_saml_payload(saml_encoding, saml_response) do
+      Protocol.verify_authn_response(xml, sp)
+    end
+  end
+
+  def decode_idp_signout_resp(sp, saml_encoding, saml_response, verification \\ []) do
     case decode_saml_payload(saml_encoding, saml_response) do
-      {:ok, xml} -> Protocol.decode_logout_response(xml, sp)
+      {:ok, xml} -> Protocol.decode_logout_response(xml, sp, verification)
       _ -> {:error, :invalid_request}
     end
   end
 
-  def decode_idp_signout_req(sp, saml_encoding, saml_request) do
+  def verify_idp_signout_resp(sp, saml_encoding, saml_response, verification \\ []) do
+    with {:ok, xml} <- decode_saml_payload(saml_encoding, saml_response) do
+      Protocol.verify_logout_response(xml, sp, verification)
+    end
+  end
+
+  def decode_idp_signout_req(sp, saml_encoding, saml_request, verification \\ []) do
     case decode_saml_payload(saml_encoding, saml_request) do
-      {:ok, xml} -> Protocol.decode_logout_request(xml, sp)
+      {:ok, xml} -> Protocol.decode_logout_request(xml, sp, verification)
       _ -> {:error, :invalid_request}
     end
   end

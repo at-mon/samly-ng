@@ -15,9 +15,14 @@ defmodule Samly.Mixfile do
       elixir: "~> 1.20.0",
       elixirc_options: [warnings_as_errors: true],
       start_permanent: Mix.env() == :prod,
+      test_ignore_filters: [&String.starts_with?(&1, "test/support/")],
       aliases: ["security.check": ["deps.audit", "hex.audit", "sobelow --config"]],
       deps: deps()
     ]
+  end
+
+  def cli do
+    [preferred_envs: ["test.json": :test, "dialyzer.json": :dev]]
   end
 
   # Run "mix help compile.app" to learn about applications.
@@ -31,24 +36,25 @@ defmodule Samly.Mixfile do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:plug, "~> 1.20.3"},
-      {:saxy, "~> 1.6.1"},
-      {:xml_builder, "~> 2.4.1"},
-      {:bandit, "~> 1.12.5", only: :test},
-      {:stream_data, "~> 1.2", only: :test},
+      {:plug, "~> 1.20"},
+      {:saxy, "~> 1.6"},
+      {:bandit, "~> 1.14", only: :test},
+      {:stream_data, "~> 1.4", only: :test},
+      {:ex_unit_json, "~> 0.4", only: [:dev, :test], runtime: false},
+      {:dialyzer_json, "~> 0.1", only: [:dev, :test], runtime: false},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
-      {:sobelow, "~> 0.15.0", only: [:dev, :test], runtime: false},
+      {:sobelow, "~> 0.16", only: [:dev, :test], runtime: false},
       {:styler, "~> 1.12", only: [:dev, :test], runtime: false},
-      {:ex_quality, "~> 0.14.0", only: :dev, runtime: false},
+      {:ex_quality, "~> 0.16", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
-      {:ex_doc, "~> 0.39", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
   end
 
   defp docs do
     [
-      extras: ["README.md", "docs/phoenix_setup.md", "docs/microsoft_entra_id.md", "docs/configuration.md", "MIGRATION.md", "SECURITY_REVIEW.md"],
+      extras: ["README.md", "docs/phoenix_setup.md", "docs/microsoft_entra_id.md", "docs/configuration.md", "docs/MIGRATION.md", "docs/SECURITY_REVIEW.md"],
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url
@@ -58,7 +64,7 @@ defmodule Samly.Mixfile do
   defp package do
     [
       maintainers: ["dropbox", "KMC"],
-      files: ["config", "lib", "docs", "LICENSE", "mix.exs", "README.md", "MIGRATION.md", "SECURITY_REVIEW.md"],
+      files: ["config", "lib", "docs", "LICENSE", "mix.exs", "README.md"],
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}
     ]

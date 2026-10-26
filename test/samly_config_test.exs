@@ -17,6 +17,21 @@ defmodule SamlyConfigTest do
     metadata_file: "test/data/idp_metadata.xml"
   }
 
+  setup do
+    previous = Map.new([Provider, :service_providers, :identity_providers], &{&1, Application.fetch_env(:samly, &1)})
+    Application.delete_env(:samly, :service_providers)
+    Application.delete_env(:samly, :identity_providers)
+
+    on_exit(fn ->
+      Enum.each(previous, fn
+        {key, {:ok, value}} -> Application.put_env(:samly, key, value)
+        {key, :error} -> Application.delete_env(:samly, key)
+      end)
+    end)
+
+    :ok
+  end
+
   test "refresh_providers" do
     Application.put_env(:samly, Provider,
       service_providers: [@sp_config],

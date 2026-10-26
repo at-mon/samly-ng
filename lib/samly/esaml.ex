@@ -68,6 +68,7 @@ defmodule Samly.Esaml do
     sp_name_qualifier: :undefined,
     name_format: :undefined,
     session_index: "",
+    session_indexes: [],
     reason: :user,
     id: ""
 

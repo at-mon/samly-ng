@@ -30,7 +30,7 @@ defmodule Samly.Provider do
     GenServer.start_link(__MODULE__, [], gs_opts)
   end
 
-  @doc false
+  @impl true
   def init([]) do
     store_env = Application.get_env(:samly, State, [])
     store_provider = store_env[:store] || Samly.State.ETS
@@ -48,14 +48,23 @@ defmodule Samly.Provider do
         value when value in [:subdomain, :path_segment] ->
           value
 
-        unknown ->
-          Logger.warning("[Samly] invalid_data idp_id_from: #{inspect(unknown)}. Using :path_segment")
+        _unknown ->
+          Logger.warning("[Samly] invalid idp_id_from configuration; using :path_segment")
 
           :path_segment
       end
 
     Application.put_env(:samly, :idp_id_from, idp_id_from)
     refresh_providers()
+  end
+
+  @impl true
+  def format_status(status) do
+    status
+    |> Map.put(:state, :redacted)
+    |> Map.put(:message, :redacted)
+    |> Map.put(:reason, :redacted)
+    |> Map.put(:log, [])
   end
 
   @doc """

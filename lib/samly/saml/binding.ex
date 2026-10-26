@@ -147,12 +147,5 @@ defmodule Samly.SAML.Binding do
 
   defp encode_form(value), do: URI.encode_www_form(to_string(value))
 
-  defp html_escape(value) do
-    value
-    |> to_string()
-    |> String.replace("&", "&amp;")
-    |> String.replace("\"", "&quot;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-  end
+  defp html_escape(value), do: Samly.HTML.escape_attribute(value)
 end

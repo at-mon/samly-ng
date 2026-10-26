@@ -39,6 +39,7 @@ defmodule Samly.SAML.XMLDSig do
     with true <- XML.valid_namespaces?(document, @vocabulary),
          [signature] <- direct_children(signed_node, "Signature"),
          [signed_info] <- direct_children(signature, "SignedInfo"),
+         :ok <- signature_structure(signature),
          :ok <- supported_structure(signed_info),
          {:ok, hash} <- supported_algorithms(signed_info, opts),
          {:ok, reference_id} <- reference_id(signed_info),
@@ -67,7 +68,7 @@ defmodule Samly.SAML.XMLDSig do
   @spec canonicalize(xml_node()) :: binary()
   def canonicalize(node), do: canonicalize(node, %{})
 
-  defp canonicalize(node, available), do: canonicalize(node, available, %{})
+  defp canonicalize(node, available), do: canonicalize(node, Map.put(available, "xml", "http://www.w3.org/XML/1998/namespace"), %{"" => ""})
 
   defp canonicalize({name, attributes, children}, available, rendered) do
     declared = namespace_declarations(attributes)
@@ -151,9 +152,10 @@ defmodule Samly.SAML.XMLDSig do
   end
 
   defp supported_algorithms(signed_info, opts) do
-    signature_method = signed_info |> first("SignatureMethod") |> algorithm()
-    digest_method = signed_info |> first("DigestMethod") |> algorithm()
-    transforms = signed_info |> descendants("Transform") |> Enum.map(&algorithm/1)
+    reference = XML.child(signed_info, "Reference")
+    signature_method = signed_info |> XML.child("SignatureMethod") |> algorithm()
+    digest_method = reference |> XML.child("DigestMethod") |> algorithm()
+    transforms = reference |> XML.child("Transforms") |> XML.children("Transform") |> Enum.map(&algorithm/1)
 
     case {signature_method, digest_method, transforms} do
       {@rsa_sha256, @sha256, [@enveloped, @exclusive]} ->
@@ -169,18 +171,40 @@ defmodule Samly.SAML.XMLDSig do
     end
   end
 
+  defp signature_structure(signature) do
+    with [signed_info, value, key_info] <- element_children(signature),
+         "SignedInfo" <- node_name(signed_info),
+         "SignatureValue" <- node_name(value),
+         "KeyInfo" <- node_name(key_info),
+         [x509_data] <- element_children(key_info),
+         "X509Data" <- node_name(x509_data),
+         [certificate] <- element_children(x509_data),
+         "X509Certificate" <- node_name(certificate),
+         {:ok, _} <- XML.scalar_text(value),
+         {:ok, _} <- XML.scalar_text(certificate) do
+      :ok
+    else
+      _ -> {:error, :unsupported_signature_structure}
+    end
+  end
+
   defp supported_structure(signed_info) do
     with [method] <- direct_children(signed_info, "CanonicalizationMethod"),
          @exclusive <- algorithm(method),
          [] <- element_children(method),
-         [_method] <- direct_children(signed_info, "SignatureMethod"),
+         [signature_method] <- direct_children(signed_info, "SignatureMethod"),
+         [] <- element_children(signature_method),
          [reference] <- direct_children(signed_info, "Reference"),
          [transforms] <- direct_children(reference, "Transforms"),
          [enveloped, exclusive] <- element_children(transforms),
+         "Transform" <- node_name(enveloped),
+         "Transform" <- node_name(exclusive),
          [] <- element_children(enveloped),
          [] <- element_children(exclusive),
-         [_digest] <- direct_children(reference, "DigestMethod"),
-         [_value] <- direct_children(reference, "DigestValue"),
+         [digest] <- direct_children(reference, "DigestMethod"),
+         [] <- element_children(digest),
+         [value] <- direct_children(reference, "DigestValue"),
+         {:ok, _} <- XML.scalar_text(value),
          3 <- length(element_children(signed_info)),
          3 <- length(element_children(reference)) do
       :ok
@@ -192,7 +216,7 @@ defmodule Samly.SAML.XMLDSig do
   defp element_children({_name, _attrs, children}), do: Enum.filter(children, &is_tuple/1)
 
   defp reference_id(signed_info) do
-    case signed_info |> first("Reference") |> attribute("URI") do
+    case signed_info |> XML.child("Reference") |> attribute("URI") do
       "#" <> id when id != "" -> {:ok, id}
       _ -> {:error, :invalid_reference}
     end
@@ -205,7 +229,7 @@ defmodule Samly.SAML.XMLDSig do
   end
 
   defp verify_digest(document, signed_info, signed_node, hash) do
-    with {:ok, expected} <- decode_text(signed_info, "DigestValue") do
+    with {:ok, expected} <- decode_text(XML.child(signed_info, "Reference"), "DigestValue") do
       context = namespace_context(document, signed_node)
 
       actual =
@@ -219,7 +243,9 @@ defmodule Samly.SAML.XMLDSig do
   end
 
   defp trusted_certificate(signature, trusted_fingerprints) do
-    with {:ok, certificate} <- decode_text(signature, "X509Certificate"),
+    x509_data = signature |> XML.child("KeyInfo") |> XML.child("X509Data")
+
+    with {:ok, certificate} <- decode_text(x509_data, "X509Certificate"),
          fingerprint = {:sha256, :crypto.hash(:sha256, certificate)},
          true <- Enum.any?(trusted_fingerprints, &secure_fingerprint?(&1, fingerprint)) do
       {:ok, certificate}
@@ -241,9 +267,12 @@ defmodule Samly.SAML.XMLDSig do
   end
 
   defp decode_text(node, name) do
-    case node |> first(name) |> XML.text() |> String.replace(~r/\s+/, "") |> Base.decode64() do
-      {:ok, value} -> {:ok, value}
-      :error -> {:error, :invalid_base64}
+    with {:ok, child} <- XML.exactly_one_child(node, name),
+         {:ok, text} <- XML.scalar_text(child),
+         {:ok, value} <- text |> String.replace(~r/[\x20\x09\x0D\x0A]/, "") |> Base.decode64() do
+      {:ok, value}
+    else
+      _ -> {:error, :invalid_base64}
     end
   end
 
@@ -262,8 +291,6 @@ defmodule Samly.SAML.XMLDSig do
     Enum.filter(children, &(node_name(&1) == wanted))
   end
 
-  defp descendants(node, wanted), do: XML.descendants(node, wanted)
-  defp first(node, wanted), do: node |> descendants(wanted) |> List.first()
   defp attribute(nil, _name), do: nil
   defp attribute(node, name), do: XML.attribute(node, name)
   defp algorithm(node), do: attribute(node, "Algorithm")
@@ -321,33 +348,16 @@ defmodule Samly.SAML.XMLDSig do
 
   defp escape_attribute(value) do
     value
-    |> escape_text()
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace("\r", "&#xD;")
     |> String.replace("\"", "&quot;")
     |> String.replace("\t", "&#x9;")
     |> String.replace("\n", "&#xA;")
   end
 
   defp namespace_context(document, target) do
-    case find_namespace_context(document, target, %{}) do
-      {:ok, context} -> context
-      :error -> %{}
-    end
-  end
-
-  defp find_namespace_context(node, target, inherited) when node == target, do: {:ok, inherited}
-
-  defp find_namespace_context({_name, attributes, children}, target, inherited) do
-    available = Map.merge(inherited, namespace_declarations(attributes))
-
-    Enum.reduce_while(children, :error, fn
-      child, _acc when is_tuple(child) ->
-        case find_namespace_context(child, target, available) do
-          {:ok, _context} = found -> {:halt, found}
-          :error -> {:cont, :error}
-        end
-
-      _text, _acc ->
-        {:cont, :error}
-    end)
+    {:ok, context} = XML.namespace_context(document, target)
+    context
   end
 end

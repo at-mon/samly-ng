@@ -200,7 +200,7 @@ defmodule Samly.SecurityTest do
       issued = DateTime.to_iso8601(now)
 
       assertion = """
-      <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assertion_#{context.test}" Version="2.0" IssueInstant="#{issued}"><saml:Issuer>urn:test:idp</saml:Issuer><saml:Subject><saml:NameID>person@example.test</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="https://sp.example.test/consume" InResponseTo="_request" NotOnOrAfter="#{expires}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotOnOrAfter="#{expires}"><saml:AudienceRestriction><saml:Audience>urn:test:sp</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement><saml:Attribute Name="email"><saml:AttributeValue>person@example.test</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>
+      <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assertion_#{context.test}" Version="2.0" IssueInstant="#{issued}"><saml:Issuer>urn:test:idp</saml:Issuer><saml:Subject><saml:NameID>person@example.test</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="https://sp.example.test/consume" InResponseTo="_request" NotOnOrAfter="#{expires}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotOnOrAfter="#{expires}"><saml:AudienceRestriction><saml:Audience>urn:test:sp</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AuthnStatement AuthnInstant="#{issued}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement><saml:Attribute Name="email"><saml:AttributeValue>person@example.test</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>
       """
 
       {:ok, signed_assertion} = XMLDSig.sign(assertion, key, cert)
@@ -246,6 +246,16 @@ defmodule Samly.SecurityTest do
                RedirectSignature.verify(query <> "&RelayState=other", "SAMLRequest", [
                  Base.encode64(cert)
                ])
+    end
+
+    test "rejects ambiguous message types and structured parameter aliases" do
+      {:ok, key} = Key.load_private_key("test/data/test.pem")
+      {:ok, cert} = Key.load_certificate("test/data/test.crt")
+      query = "https://idp.example.test/sso" |> Binding.redirect_url("<LogoutRequest/>", "state", signing_key: key) |> URI.parse() |> Map.fetch!(:query)
+
+      for suffix <- ["&SAMLResponse=other", "&RelayState[override]=other", "&SAMLRequest[]=other"] do
+        assert {:error, _} = RedirectSignature.verify(query <> suffix, "SAMLRequest", [Base.encode64(cert)])
+      end
     end
 
     test "signs generated Redirect binding URLs" do

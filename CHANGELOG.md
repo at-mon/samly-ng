@@ -1,5 +1,62 @@
 # CHANGELOG
 
+### [Unreleased]
+
+#### 🔒 Fixed
+#### 💡 Added
+#### 🪄 Changed
+#### 📃 Documentation
+
+
+
+### v2.0.1 - 2026-10-26
+
+
+#### ⚠️ Breaking
+
++   ✨ feat!: Replace identity-keyed browser sessions with versioned, random per-login locators; custom `Samly.State.Store` keys now mean `{idp_id, opaque_session_id}` instead of `{idp_id, NameID}`.
++   ✨ feat!: Require custom assertion stores to implement `revoke_assertions/3` for IdP-initiated logout, matching the qualified subject and any supplied SessionIndexes atomically.
++   ✨ feat!: Introduce trust-scoped replay keys and require atomic `Samly.ReplayCache.consume_many/1` for multi-ID messages; migrate live history or quiesce every accepting node through the remaining validity window before upgrading.
++   🔒 security: Reject ambiguous IdP metadata, unusable RSA credentials, configurations disabling both incoming signature requirements, malformed SAML claims, unsupported XML structures, and unsafe URL configurations that earlier versions could accept.
+
+#### 🔒 Fixed
+
++   🔒 security: Prevent unrelated entity or SP-role certificates in aggregate metadata from authenticating as the selected IdP while preserving its signing-certificate rollover support.
++   🔒 security: Prevent concurrent logins for one NameID from replacing another browser's claims or reviving revoked ETS sessions after a later login.
++   🔒 security: Retain replay protection through the latest bearer-confirmation expiry plus clock skew, with microsecond precision, preventing reuse through a later-expiring confirmation.
++   🔒 security: Consume only authenticated message IDs with all-or-nothing replay insertion, preventing rejected unsigned-envelope variations from filling the cache.
++   🔒 security: Validate authentication and logout-response browser correlation before replay commitment so an unrelated browser cannot prematurely consume a valid response.
++   🔒 security: Require authentication statements, supported assertion conditions, unambiguous scalar identities and audiences, and consistent bearer recipient, correlation, and expiry checks.
++   🔒 security: Validate XML characters, references, namespace bindings, duplicate expanded attributes, signature cardinality, and encryption parameters; reject unsupported processing instructions rather than silently discarding them.
++   🐛 fix: Preserve signature-relevant character references and whitespace across XML serialization and canonicalization, including inherited namespaces and default-namespace resets.
++   🔒 security: Bind Redirect verification and decoding to the same parameters, reject conflicting message types and query/body security fields, and enforce scalar parameter shapes.
++   🔒 security: Reject encoded control characters, backslashes, malformed URL escapes, inappropriate userinfo/query/fragment components, and invalid ports in return-target and endpoint configuration.
++   🔒 security: Revoke local sessions before logout callbacks, preserve qualified NameIDs and all SessionIndexes, and keep callback failures from restoring authentication.
++   🔒 security: Restrict CSP reporting to bounded POST bodies with partial/error-read handling; redact credential-bearing provider inspection, configuration errors, and sensitive OTP status.
+
+#### 💡 Added
+
++   💡 feat: Retain bounded raw authentication diagnostics behind per-IdP `debug_mode: true` and CSP diagnostics behind `debug_csp_reports: true`, both disabled by default and also requiring Logger's debug level.
++   🔒 security: Cap raw diagnostic messages at 8000 rendered bytes and CSP request bodies at 16 KiB; private keys and session secrets remain excluded, and HTTP errors never reflect raw payloads.
++   🧪 tests: Add real HTTP session-isolation, login/logout, metadata-trust, replay, routing, and diagnostic regressions, plus parser, concurrency, atom-growth, and independent signature/encryption vectors.
++   🧪 tests: Enforce a separate 90% coverage gate in CI and install `xmllint` and OpenSSL for independent cryptographic test cases.
+
+#### 🪄 Changed
+
++   🪄 refactor: Move assertion ETS tables to supervised protected owners with serialized writes, fail-closed reads, expiry/index cleanup, and configurable `max_entries` and `cleanup_interval_ms` defaults of 10,000 sessions and 60,000 ms.
++   🚀 perf: Process XML lexical input in binary chunks instead of allocating a list element per byte, reducing heap amplification near the payload limit.
++   🔒 security: Update the CI OTP matrix to 27.3.4.18, 28.5.0.7, and 29.1.2 to include the ASN.1 decoder fixes for CVE-2026-65634.
++   📦 package: Update locked Bandit to 1.14.0, Plug.Crypto to 2.2.1, Thousand Island to 1.6.0, Sobelow and ExQuality to 0.16.0, and add development/test JSON tooling for ExUnit and Dialyzer.
++   🔥 clean: Remove the unused `xml_builder` runtime dependency after introducing signature-preserving XML serialization.
++   🧪 tests: Isolate tests that mutate application configuration and bind HTTP listeners directly to port zero to avoid port-reservation races.
+
+#### 📃 Documentation
+
++   📃 docs: Document session reauthentication, custom-store key and revocation contracts, atomic replay adapters, and coordinated replay-namespace migration in [MIGRATION.md](docs/MIGRATION.md).
++   📃 docs: Refresh the [security review](docs/SECURITY_REVIEW.md), [configuration reference](docs/configuration.md), and [Phoenix setup guide](docs/phoenix_setup.md) with reproduced findings, diagnostic controls, patched runtime requirements, and verification limits.
++   📃 docs: Clarify that node-local replay history does not survive restarts or span replicas, cookie-only assertion storage cannot revoke copied cookies, and real-IdP interoperability still requires deployment validation.
++   🐛 fix: Correct README and ExDoc/package references to the migration and security documents under `docs/`.
+
 ### v2.0.0 - 2026-09-27
 
 Major release.

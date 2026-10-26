@@ -6,6 +6,7 @@ defmodule Samly.SpData do
 
   require Logger
 
+  @derive {Inspect, only: [:id, :entity_id, :valid?]}
   defstruct id: "",
             entity_id: "",
             certfile: "",
@@ -30,7 +31,7 @@ defmodule Samly.SpData do
           org_displayname: binary(),
           org_url: binary(),
           cert: :undefined | binary(),
-          key: :undefined | :RSAPrivateKey,
+          key: :undefined | tuple(),
           valid?: boolean()
         }
 
@@ -66,7 +67,19 @@ defmodule Samly.SpData do
     |> set_id(opts_map)
     |> load_cert(opts_map)
     |> load_key(opts_map)
+    |> validate_key_pair()
   end
+
+  defp validate_key_pair(%SpData{cert: cert, key: key} = sp_data) when is_binary(cert) and is_tuple(key) do
+    if Key.matching_pair?(cert, key) do
+      sp_data
+    else
+      Logger.error("[Samly] SP certificate and private key do not match")
+      %{sp_data | valid?: false}
+    end
+  end
+
+  defp validate_key_pair(sp_data), do: sp_data
 
   @spec set_id(t(), map()) :: t()
   defp set_id(%SpData{} = sp_data, %{} = opts_map) do

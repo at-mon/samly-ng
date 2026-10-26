@@ -25,8 +25,8 @@ defmodule Samly do
   """
   @spec get_active_assertion(Conn.t()) :: nil | Assertion.t()
   def get_active_assertion(conn) do
-    case Conn.get_session(conn, "samly_assertion_key") do
-      {_idp_id, _nameid} = assertion_key ->
+    case State.assertion_key(conn) do
+      {_idp_id, _session_id} = assertion_key ->
         State.get_assertion(conn, assertion_key)
 
       _ ->

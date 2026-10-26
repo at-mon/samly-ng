@@ -17,6 +17,15 @@ defmodule Samly.BanditEndpoint do
     %{conn | secret_key_base: String.duplicate("samly-e2e-secret-", 4)}
   end
 
+  defp not_found(%{request_path: "/protected"} = conn, _opts) do
+    conn = Plug.Conn.fetch_session(conn)
+
+    case Samly.get_active_assertion(conn) do
+      nil -> Plug.Conn.send_resp(conn, 401, "unauthenticated")
+      assertion -> Plug.Conn.send_resp(conn, 200, assertion.attributes["role"] || "authenticated")
+    end
+  end
+
   defp not_found(conn, _opts), do: Plug.Conn.send_resp(conn, 404, "not_found")
 end
 
@@ -24,20 +33,20 @@ defmodule Samly.BanditE2ETest do
   use ExUnit.Case, async: false
 
   alias Samly.SAML.Key
-  alias Samly.SAML.XMLDSig
+  alias Samly.State.ETS
+  alias Samly.Test.SAMLFixture
 
-  setup do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
-    {:ok, port} = :inet.port(socket)
-    :ok = :gen_tcp.close(socket)
+  setup context do
+    server = start_supervised!({Bandit, plug: Samly.BanditEndpoint, port: 0, ip: {127, 0, 0, 1}})
+    {:ok, {_address, port}} = ThousandIsland.listener_info(server)
 
     previous = Application.get_env(:samly, Samly.Provider)
     previous_runtime = Map.new([:identity_providers, :service_providers, :state_store], &{&1, Application.fetch_env(:samly, &1)})
-    Samly.State.init(Samly.State.Session)
+    Samly.State.init(Map.get(context, :store, Samly.State.Session))
     {:ok, certificate} = Key.load_certificate("test/data/test.crt")
 
     metadata = """
-    <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="urn:test:idp"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>#{Base.encode64(certificate)}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example.test/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>
+    <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="urn:test:idp"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>#{Base.encode64(certificate)}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example.test/sso"/><md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example.test/logout"/></md:IDPSSODescriptor></md:EntityDescriptor>
     """
 
     Application.put_env(:samly, Samly.Provider,
@@ -55,18 +64,17 @@ defmodule Samly.BanditE2ETest do
           sp_id: "sp1",
           base_url: "http://127.0.0.1:#{port}/sso",
           metadata: metadata,
-          allow_idp_initiated_flow: true
+          allow_idp_initiated_flow: true,
+          signed_envelopes_in_resp: Map.get(context, :signed_envelopes, true),
+          on_logout: logout_callback(context)
         }
       ]
     )
 
     {:ok, _state} = Samly.Provider.refresh_providers()
-    {:ok, server} = Bandit.start_link(plug: Samly.BanditEndpoint, port: port, ip: {127, 0, 0, 1})
     :inets.start()
 
     on_exit(fn ->
-      if Process.alive?(server), do: Process.exit(server, :shutdown)
-
       if previous do
         Application.put_env(:samly, Samly.Provider, previous)
       else
@@ -82,6 +90,197 @@ defmodule Samly.BanditE2ETest do
     end)
 
     %{port: port}
+  end
+
+  @tag store: ETS
+  test "separate browser logins for the same subject cannot replace each other's claims", %{port: port} do
+    first = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", role: "member")
+    second = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", role: "admin")
+    assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, first, "/")
+    cookie = headers |> List.keyfind(~c"set-cookie", 0) |> elem(1) |> to_string() |> String.split(";") |> hd()
+    assert {:ok, {{_, 200, _}, _, ~c"member"}} = cookie_request(port, cookie)
+    assert {:ok, {{_, 302, _}, _, _}} = post_response(port, second, "/")
+    assert {:ok, {{_, 200, _}, _, ~c"member"}} = cookie_request(port, cookie)
+  end
+
+  @tag store: ETS
+  test "an old cookie stays revoked after IdP logout and a fresh login", %{port: port} do
+    xml = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", session_index: "revoked-index")
+    assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, xml, "/")
+    cookie = response_cookie(headers)
+    assert {:ok, {{_, 200, _}, _, _}} = cookie_request(port, cookie)
+
+    assert {:ok, {{_, 200, _}, _, _}} = post_logout(port, "revoked-index")
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, cookie)
+    assert {:ok, {{_, 302, _}, _, _}} = post_response(port, signed_response(port), "/")
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, cookie)
+  end
+
+  @tag store: ETS
+  test "cookie-less IdP logout only revokes sessions matching its index", %{port: port} do
+    cookies =
+      for index <- ["first-index", "second-index"] do
+        xml = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", session_index: index)
+        assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, xml, "/")
+        response_cookie(headers)
+      end
+
+    assert {:ok, {{_, 200, _}, _, _}} = post_logout(port, "first-index")
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, Enum.at(cookies, 0))
+    assert {:ok, {{_, 200, _}, _, _}} = cookie_request(port, Enum.at(cookies, 1))
+  end
+
+  test "SP initiated login traverses HTTP CSRF, request correlation and session renewal", %{port: port} do
+    assert {:ok, {{_, 200, _}, headers, body}} = request(port, "/sso/auth/signin/idp1")
+    cookie = response_cookie(headers)
+    [_, csrf] = Regex.run(~r/name="_csrf_token" value="([^"]+)"/, to_string(body))
+    assert {:ok, {{_, 200, _}, headers, body}} = post_form(port, "/sso/auth/signin/idp1", %{"_csrf_token" => csrf}, cookie)
+    cookie = response_cookie(headers)
+    [_, encoded] = Regex.run(~r/name="SAMLRequest" value="([^"]+)"/, to_string(body))
+    [_, relay] = Regex.run(~r/name="RelayState" value="([^"]+)"/, to_string(body))
+    {:ok, request_id} = encoded |> Base.decode64!() |> Samly.SAML.Protocol.message_id()
+    response = signed_response(port, request_id)
+    assert {:ok, {{_, 302, _}, headers, _}} = post_form(port, "/sso/sp/consume/idp1", %{"SAMLResponse" => Base.encode64(response), "RelayState" => relay}, cookie)
+    assert {:ok, {{_, 200, _}, _, _}} = cookie_request(port, response_cookie(headers))
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, cookie)
+  end
+
+  @tag store: ETS
+  test "local logout revokes before the IdP roundtrip and validates its response", %{port: port} do
+    alias Samly.Esaml
+
+    require Esaml
+
+    assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, signed_response(port), "/")
+    original_cookie = response_cookie(headers)
+    assert {:ok, {{_, 200, _}, headers, body}} = get_with_cookie(port, "/sso/auth/signout/idp1", original_cookie)
+    cookie = response_cookie(headers)
+    [_, csrf] = Regex.run(~r/name="_csrf_token" value="([^"]+)"/, to_string(body))
+    assert {:ok, {{_, 200, _}, headers, body}} = post_form(port, "/sso/auth/signout/idp1", %{"_csrf_token" => csrf}, cookie)
+    cookie = response_cookie(headers)
+    [_, request] = Regex.run(~r/name="SAMLRequest" value="([^"]+)"/, to_string(body))
+    [_, relay] = Regex.run(~r/name="RelayState" value="([^"]+)"/, to_string(body))
+    {:ok, request_id} = request |> Base.decode64!() |> Samly.SAML.Protocol.message_id()
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, original_cookie)
+    {:ok, key} = Key.load_private_key("test/data/test.pem")
+    {:ok, cert} = Key.load_certificate("test/data/test.crt")
+    sp = Esaml.esaml_sp(entity_id: ~c"urn:test:idp", key: key, certificate: cert, sp_sign_requests: true)
+    response = Samly.SAML.Protocol.logout_response("http://127.0.0.1:#{port}/sso/sp/logout/idp1", sp, :success, request_id)
+    assert {:ok, {{_, 302, _}, _, _}} = post_form(port, "/sso/sp/logout/idp1", %{"SAMLResponse" => Base.encode64(response), "RelayState" => relay}, cookie)
+  end
+
+  @tag store: ETS
+  test "Redirect logout uses verified raw parameters and default DEFLATE binding", %{port: port} do
+    alias Samly.Esaml
+
+    require Esaml
+
+    {:ok, key} = Key.load_private_key("test/data/test.pem")
+    sp = Esaml.esaml_sp(entity_id: ~c"urn:test:idp")
+    subject = Samly.Subject.to_rec(%Samly.Subject{name: "person@example.test"})
+    xml = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", session_index: "redirect-index")
+    assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, xml, "/")
+    cookie = response_cookie(headers)
+    destination = "http://127.0.0.1:#{port}/sso/sp/logout/idp1"
+    logout = Samly.SAML.Protocol.logout_request(destination, sp, subject, "redirect-index")
+    query = destination |> Samly.SAML.Binding.redirect_url(logout, "state+value", signing_key: key) |> URI.parse() |> Map.fetch!(:query)
+    query = query |> String.split("&") |> Enum.reject(&String.starts_with?(&1, "SAMLEncoding=")) |> Enum.join("&")
+    assert {:ok, {{_, 200, _}, _, _}} = request(port, "/sso/sp/logout/idp1?" <> query)
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, cookie)
+    assert {:ok, {{_, 403, _}, _, _}} = request(port, "/sso/sp/logout/idp1?" <> query)
+  end
+
+  test "malformed parameter shapes fail closed without diagnostic crashes", %{port: port} do
+    for params <- [
+          %{"SAMLResponse" => ["nested"]},
+          %{"SAMLResponse" => "bad", "RelayState" => %{"x" => "nested"}},
+          %{"SAMLResponse" => "bad", "SAMLRequest" => "other"},
+          %{"SAMLResponse" => "bad", "SAMLEncoding" => "unsupported"}
+        ] do
+      assert {:ok, {{_, 403, _}, _, _}} = post_form(port, "/sso/sp/consume/idp1", params)
+    end
+  end
+
+  defp get_with_cookie(port, path, cookie) do
+    :httpc.request(:get, {~c"http://127.0.0.1:#{port}#{path}", [{~c"cookie", to_charlist(cookie)}]}, [autoredirect: false], body_format: :string)
+  end
+
+  @tag store: ETS, failing_logout_callback: true
+  test "logout callback failures do not undo authoritative revocation or leak exception text", %{port: port} do
+    xml = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", session_index: "callback-index")
+    assert {:ok, {{_, 302, _}, headers, _}} = post_response(port, xml, "/")
+    cookie = response_cookie(headers)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, {{_, 200, _}, _, _}} = post_logout(port, "callback-index")
+      end)
+
+    assert log =~ "on_logout callback failed"
+    refute log =~ "callback-secret"
+    assert {:ok, {{_, 401, _}, _, _}} = cookie_request(port, cookie)
+  end
+
+  defp logout_callback(%{failing_logout_callback: true}), do: fn _, _ -> raise "callback-secret" end
+  defp logout_callback(_context), do: nil
+
+  defp post_logout(port, index) do
+    alias Samly.Esaml
+
+    require Esaml
+
+    {:ok, key} = Key.load_private_key("test/data/test.pem")
+    {:ok, cert} = Key.load_certificate("test/data/test.crt")
+    sp = Esaml.esaml_sp(entity_id: ~c"urn:test:idp", key: key, certificate: cert, sp_sign_requests: true)
+    subject = Samly.Subject.to_rec(%Samly.Subject{name: "person@example.test"})
+    xml = Samly.SAML.Protocol.logout_request("http://127.0.0.1:#{port}/sso/sp/logout/idp1", sp, subject, index)
+    post_form(port, "/sso/sp/logout/idp1", %{"SAMLRequest" => Base.encode64(xml)})
+  end
+
+  defp response_cookie(headers) do
+    headers |> List.keyfind(~c"set-cookie", 0) |> elem(1) |> to_string() |> String.split(";") |> hd()
+  end
+
+  defp post_form(port, path, params, cookie \\ nil) do
+    headers = if cookie, do: [{~c"cookie", to_charlist(cookie)}], else: []
+    :httpc.request(:post, {~c"http://127.0.0.1:#{port}#{path}", headers, ~c"application/x-www-form-urlencoded", Plug.Conn.Query.encode(params)}, [autoredirect: false], body_format: :string)
+  end
+
+  test "signed assertions without authentication statements are rejected", %{port: port} do
+    xml =
+      SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1",
+        transform: &Regex.replace(~r/<saml:AuthnStatement.*?<\/saml:AuthnStatement>/s, &1, "")
+      )
+
+    assert {:ok, {{_, 403, _}, _, _}} = post_response(port, xml, "/")
+  end
+
+  test "unknown mandatory assertion conditions are rejected", %{port: port} do
+    xml =
+      SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1",
+        transform: &String.replace(&1, "</saml:Conditions>", ~s(<saml:Condition xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="unrecognized"/></saml:Conditions>))
+      )
+
+    assert {:ok, {{_, 403, _}, _, _}} = post_response(port, xml, "/")
+  end
+
+  @tag signed_envelopes: false
+  test "rejected assertion replays do not consume new unsigned response identifiers", %{port: port} do
+    xml = SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", sign_envelope: false)
+    assert {:ok, {{_, 302, _}, _, _}} = post_response(port, xml, "/")
+    {table, _limit} = :sys.get_state(Samly.ReplayCache.ETS)
+    before_size = :ets.info(table, :size)
+
+    for index <- 1..3 do
+      replay = Regex.replace(~r/ID="_r[0-9]+"/, xml, ~s(ID="_mutated_#{index}"))
+      assert {:ok, {{_, 403, _}, _, _}} = post_response(port, replay, "/")
+    end
+
+    assert :ets.info(table, :size) == before_size
+  end
+
+  defp cookie_request(port, cookie) do
+    :httpc.request(:get, {~c"http://127.0.0.1:#{port}/protected", [{~c"cookie", to_charlist(cookie)}]}, [autoredirect: false], body_format: :string)
   end
 
   test "a bearer assertion cannot create sessions through two independent HTTP requests", %{port: port} do
@@ -144,26 +343,7 @@ defmodule Samly.BanditE2ETest do
   end
 
   defp signed_response(port, response_to \\ nil) do
-    {:ok, key} = Key.load_private_key("test/data/test.pem")
-    {:ok, cert} = Key.load_certificate("test/data/test.crt")
-    id = System.unique_integer([:positive])
-    issued = DateTime.to_iso8601(DateTime.utc_now())
-    expires = DateTime.to_iso8601(DateTime.shift(DateTime.utc_now(), minute: 5))
-    recipient = "http://127.0.0.1:#{port}/sso/sp/consume/idp1"
-    correlation = if response_to, do: ~s( InResponseTo="#{response_to}"), else: ""
-
-    assertion = """
-    <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a#{id}" Version="2.0" IssueInstant="#{issued}"><saml:Issuer>urn:test:idp</saml:Issuer><saml:Subject><saml:NameID>person@example.test</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="#{recipient}"#{correlation} NotOnOrAfter="#{expires}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotOnOrAfter="#{expires}"><saml:AudienceRestriction><saml:Audience>urn:test:sp1</saml:Audience></saml:AudienceRestriction></saml:Conditions></saml:Assertion>
-    """
-
-    {:ok, assertion} = XMLDSig.sign(assertion, key, cert)
-
-    response = """
-    <samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r#{id}"#{correlation} Version="2.0" IssueInstant="#{issued}" Destination="#{recipient}"><saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">urn:test:idp</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>#{assertion}</samlp:Response>
-    """
-
-    {:ok, signed} = XMLDSig.sign(response, key, cert)
-    signed
+    SAMLFixture.response("http://127.0.0.1:#{port}/sso/sp/consume/idp1", response_to: response_to)
   end
 
   test "serves signed SP metadata through Bandit", %{port: port} do

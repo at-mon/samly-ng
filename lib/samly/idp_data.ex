@@ -14,6 +14,7 @@ defmodule Samly.IdpData do
   alias Samly.Esaml
   alias Samly.Helper
   alias Samly.IdpData
+  alias Samly.SAML.Key
   alias Samly.SAML.XML
   alias Samly.SpData
 
@@ -24,6 +25,7 @@ defmodule Samly.IdpData do
   @type certs :: [binary()]
   @type url :: nil | binary()
 
+  @derive {Inspect, only: [:id, :sp_id, :entity_id, :valid?]}
   defstruct id: "",
             sp_id: "",
             base_url: nil,
@@ -119,8 +121,8 @@ defmodule Samly.IdpData do
       try do
         [load_provider(idp_config, service_providers)]
       rescue
-        error ->
-          Logger.error("[Samly] Failed to load identity provider #{inspect(idp_config[:id])}: #{Exception.message(error)}")
+        _error ->
+          Logger.error("[Samly] Failed to load identity provider configuration")
 
           []
       end
@@ -158,6 +160,15 @@ defmodule Samly.IdpData do
     |> set_boolean_attr(opts_map, :force_authn)
     |> set_boolean_attr(opts_map, :allow_legacy_sha1)
     |> set_boolean_attr(opts_map, :debug_mode)
+    |> validate_config!()
+  end
+
+  defp validate_config!(%IdpData{} = idp_data) do
+    if !(is_nil(idp_data.base_url) or valid_url?(idp_data.base_url, :base)) do
+      raise ArgumentError, "invalid IdP base URL"
+    end
+
+    idp_data
   end
 
   @spec load_metadata(t()) :: t()
@@ -170,8 +181,8 @@ defmodule Samly.IdpData do
       {:ok, metadata} ->
         load_metadata(%{idp_data | metadata: metadata})
 
-      {:error, reason} ->
-        Logger.error("[Samly] Failed to read metadata_file [#{inspect(idp_data.metadata_file)}]: #{inspect(reason)}")
+      {:error, _reason} ->
+        Logger.error("[Samly] Failed to read IdP metadata file")
 
         idp_data
     end
@@ -186,13 +197,19 @@ defmodule Samly.IdpData do
   @spec update_esaml_recs(t(), %{required(id()) => SpData.t()}, map()) :: t()
   defp update_esaml_recs(%IdpData{} = idp_data, service_providers, opts_map) do
     case Map.get(service_providers, idp_data.sp_id) do
-      %SpData{} = sp ->
+      %SpData{valid?: true} = sp ->
         idp_data = %{idp_data | esaml_idp_rec: to_esaml_idp_metadata(idp_data, opts_map)}
         idp_data = %{idp_data | esaml_sp_rec: get_esaml_sp(sp, idp_data)}
-        %{idp_data | valid?: idp_data.valid? and idp_data.id != "" and cert_config_ok?(idp_data, sp)}
+
+        %{
+          idp_data
+          | valid?:
+              idp_data.valid? and idp_data.id != "" and cert_config_ok?(idp_data, sp) and
+                (idp_data.signed_assertion_in_resp or idp_data.signed_envelopes_in_resp)
+        }
 
       _ ->
-        Logger.error("[Samly] Unknown/invalid sp_id: #{idp_data.sp_id}")
+        Logger.error("[Samly] Unknown or invalid SP configuration")
         %{idp_data | valid?: false}
     end
   end
@@ -201,7 +218,7 @@ defmodule Samly.IdpData do
   defp cert_config_ok?(%IdpData{} = idp_data, %SpData{} = sp_data) do
     if (idp_data.sign_metadata || idp_data.sign_requests) &&
          (sp_data.cert == :undefined || sp_data.key == :undefined) do
-      Logger.error("[Samly] SP cert or key missing - Skipping identity provider: #{idp_data.id}")
+      Logger.error("[Samly] SP cert or key missing - skipping identity provider")
       false
     else
       true
@@ -211,7 +228,7 @@ defmodule Samly.IdpData do
   @spec verify_slo_url(t()) :: t()
   defp verify_slo_url(%IdpData{} = idp_data) do
     if idp_data.valid? && idp_data.slo_redirect_url == nil && idp_data.slo_post_url == nil do
-      Logger.warning("[Samly] SLO Endpoint missing in [#{inspect(idp_data.metadata_file)}]")
+      Logger.warning("[Samly] IdP SLO endpoint missing")
     end
 
     idp_data
@@ -248,9 +265,15 @@ defmodule Samly.IdpData do
   defp set_custom_uri(%IdpData{} = idp_data, opts_map, field) do
     value =
       case Map.get(opts_map, field) do
-        nil -> nil
-        uri when is_binary(uri) -> String.to_charlist(uri)
-        _ -> raise ArgumentError, "#{inspect(field)} must be a URL string"
+        nil ->
+          nil
+
+        uri when is_binary(uri) ->
+          if not valid_url?(uri, :callback), do: raise(ArgumentError, "invalid custom callback URL")
+          String.to_charlist(uri)
+
+        _ ->
+          raise ArgumentError, "#{inspect(field)} must be a URL string"
       end
 
     Map.put(idp_data, field, value)
@@ -259,8 +282,15 @@ defmodule Samly.IdpData do
   defp set_allowed_target_urls(%IdpData{} = idp_data, %{} = opts_map) do
     target_urls =
       case Map.get(opts_map, :allowed_target_urls, nil) do
-        nil -> nil
-        urls when is_list(urls) -> Enum.filter(urls, &is_binary/1)
+        nil ->
+          nil
+
+        urls when is_list(urls) ->
+          if not Enum.all?(urls, &valid_url?(&1, :target)), do: raise(ArgumentError, "invalid redirect allowlist")
+          urls
+
+        _ ->
+          raise ArgumentError, "redirect allowlist must be a list of URLs"
       end
 
     %{idp_data | allowed_target_urls: target_urls}
@@ -278,7 +308,7 @@ defmodule Samly.IdpData do
 
         format when is_atom(format) ->
           Map.get_lazy(@nameid_formats, format, fn ->
-            Logger.error("[Samly] invalid nameid_format [#{inspect(idp_data.metadata_file)}]: #{inspect(format)}")
+            Logger.error("[Samly] Invalid configured NameID format")
 
             idp_data.nameid_format
           end)
@@ -295,25 +325,27 @@ defmodule Samly.IdpData do
 
   @spec from_xml(binary, t()) :: t()
   defp from_xml(metadata_xml, %IdpData{} = idp_data) when is_binary(metadata_xml) do
-    case XML.parse(metadata_xml) do
-      {:ok, md_xml} ->
-        signing_certs = get_signing_certs(md_xml)
-
-        %{
-          idp_data
-          | valid?: get_entity_id(md_xml) != "" and signing_certs != [],
-            entity_id: get_entity_id(md_xml),
-            certs: signing_certs,
-            fingerprints: idp_cert_fingerprints(signing_certs),
-            sso_redirect_url: get_sso_redirect_url(md_xml),
-            sso_post_url: get_sso_post_url(md_xml),
-            slo_redirect_url: get_slo_redirect_url(md_xml),
-            slo_post_url: get_slo_post_url(md_xml),
-            nameid_format: get_nameid_format(md_xml)
-        }
-
-      {:error, reason} ->
-        Logger.error("[Samly] Invalid IdP metadata: #{inspect(reason)}")
+    with {:ok, md_xml} <- XML.parse(metadata_xml),
+         {:ok, entity, role} <- select_idp(md_xml),
+         entity_id when is_binary(entity_id) and entity_id != "" <- XML.attribute(entity, "entityID"),
+         true <- safe_url_text?(entity_id),
+         {:ok, signing_certs} <- validated_signing_certs(role),
+         {:ok, endpoints} <- endpoints(role) do
+      %{
+        idp_data
+        | valid?: true,
+          entity_id: entity_id,
+          certs: signing_certs,
+          fingerprints: idp_cert_fingerprints(signing_certs),
+          sso_redirect_url: endpoints.sso_redirect,
+          sso_post_url: endpoints.sso_post,
+          slo_redirect_url: endpoints.slo_redirect,
+          slo_post_url: endpoints.slo_post,
+          nameid_format: role_nameid_format(role)
+      }
+    else
+      _ ->
+        Logger.error("[Samly] Invalid or ambiguous IdP metadata")
         %{idp_data | valid?: false}
     end
   end
@@ -396,32 +428,35 @@ defmodule Samly.IdpData do
     )
   end
 
+  @metadata_ns "urn:oasis:names:tc:SAML:2.0:metadata"
+  @signature_ns "http://www.w3.org/2000/09/xmldsig#"
+  @saml2_protocol "urn:oasis:names:tc:SAML:2.0:protocol"
+
   @doc false
   @spec get_entity_id(XML.xml_node()) :: binary()
   def get_entity_id(md_elem) do
-    md_elem
-    |> XML.descendants("EntityDescriptor")
-    |> List.first()
-    |> then(fn node -> if node, do: XML.attribute(node, "entityID") end)
-    |> to_string()
-    |> String.trim()
+    case select_idp(md_elem) do
+      {:ok, entity, _role} -> XML.attribute(entity, "entityID") || ""
+      _ -> ""
+    end
   end
 
   @doc false
   @spec get_nameid_format(XML.xml_node()) :: nameid_format()
   def get_nameid_format(md_elem) do
-    case md_elem |> first_descendant("NameIDFormat") |> XML.text() do
-      "" -> :unknown
-      nameid_format -> to_charlist(nameid_format)
+    case select_idp(md_elem) do
+      {:ok, _entity, role} -> role_nameid_format(role)
+      _ -> :unknown
     end
   end
 
   @doc false
   @spec get_req_signed(XML.xml_node()) :: binary()
   def get_req_signed(md_elem) do
-    md_elem
-    |> first_descendant("IDPSSODescriptor")
-    |> attribute_or_empty("WantAuthnRequestsSigned")
+    case select_idp(md_elem) do
+      {:ok, _entity, {role, _namespaces}} -> XML.attribute(role, "WantAuthnRequestsSigned") || ""
+      _ -> ""
+    end
   end
 
   @doc false
@@ -433,12 +468,10 @@ defmodule Samly.IdpData do
   def get_enc_certs(md_elem), do: get_certs(md_elem, :encryption)
 
   defp get_certs(md_elem, purpose) do
-    md_elem
-    |> XML.descendants("KeyDescriptor")
-    |> Enum.filter(&key_for_purpose?(&1, purpose))
-    |> Enum.map(fn key -> key |> first_descendant("X509Certificate") |> XML.text() end)
-    |> Enum.map(&String.replace(&1, ~r/\s+/, ""))
-    |> Enum.reject(&(&1 == ""))
+    case select_idp(md_elem) do
+      {:ok, _entity, role} -> role_certs(role, purpose)
+      _ -> []
+    end
   end
 
   @doc false
@@ -458,21 +491,158 @@ defmodule Samly.IdpData do
   def get_slo_post_url(md_elem), do: get_url(md_elem, "SingleLogoutService", @post)
 
   defp get_url(md_elem, service, binding) do
-    md_elem
-    |> XML.descendants(service)
-    |> Enum.find(&(XML.attribute(&1, "Binding") == binding))
-    |> case do
-      nil -> nil
-      node -> XML.attribute(node, "Location")
+    with {:ok, _entity, role} <- select_idp(md_elem),
+         {:ok, url} <- role_url(role, service, binding) do
+      url
+    else
+      _ -> nil
     end
   end
 
-  defp first_descendant(nil, _name), do: nil
-  defp first_descendant(node, name), do: node |> XML.descendants(name) |> List.first()
+  # Carry namespace context with each selected node without rewriting signed XML.
+  defp select_idp(md_elem) do
+    case idp_roles(scoped(md_elem, %{})) do
+      [{entity, role}] -> {:ok, entity, role}
+      _ -> {:error, :ambiguous_idp_metadata}
+    end
+  end
 
-  defp attribute_or_empty(nil, _name), do: ""
-  defp attribute_or_empty(node, name), do: XML.attribute(node, name) || ""
+  defp idp_roles({entity, _namespaces} = scoped_node) do
+    case expanded_name(scoped_node) do
+      {@metadata_ns, "EntityDescriptor"} ->
+        scoped_node
+        |> scoped_children(@metadata_ns, "IDPSSODescriptor")
+        |> Enum.filter(fn {role, _} -> @saml2_protocol in String.split(XML.attribute(role, "protocolSupportEnumeration") || "") end)
+        |> Enum.map(&{entity, &1})
 
-  defp key_for_purpose?(node, :encryption), do: XML.attribute(node, "use") == "encryption"
-  defp key_for_purpose?(node, :signing), do: XML.attribute(node, "use") != "encryption"
+      {@metadata_ns, "EntitiesDescriptor"} ->
+        scoped_node
+        |> scoped_children()
+        |> Enum.flat_map(&idp_roles/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp scoped({_, attrs, _} = node, inherited) do
+    namespaces =
+      Enum.reduce(attrs, inherited, fn
+        {"xmlns", value}, acc -> Map.put(acc, "", value)
+        {"xmlns:" <> prefix, value}, acc -> Map.put(acc, prefix, value)
+        _, acc -> acc
+      end)
+
+    {node, namespaces}
+  end
+
+  defp expanded_name({{name, _, _}, namespaces}) do
+    case String.split(name, ":", parts: 2) do
+      [prefix, local] -> {Map.get(namespaces, prefix), local}
+      [local] -> {Map.get(namespaces, ""), local}
+    end
+  end
+
+  defp scoped_children({{_, _, children}, namespaces}) do
+    for {_, _, _} = child <- children, do: scoped(child, namespaces)
+  end
+
+  defp scoped_children(node, namespace, local) do
+    node |> scoped_children() |> Enum.filter(&(expanded_name(&1) == {namespace, local}))
+  end
+
+  defp role_nameid_format(role) do
+    case scoped_children(role, @metadata_ns, "NameIDFormat") do
+      [{node, _} | _] ->
+        case scalar_text(node) do
+          "" -> :unknown
+          value -> String.to_charlist(value)
+        end
+
+      [] ->
+        :unknown
+    end
+  end
+
+  defp role_certs(role, purpose) do
+    role
+    |> scoped_children(@metadata_ns, "KeyDescriptor")
+    |> Enum.filter(fn {key, _} -> key_for_purpose?(key, purpose) end)
+    |> Enum.flat_map(&scoped_children(&1, @signature_ns, "KeyInfo"))
+    |> Enum.flat_map(&scoped_children(&1, @signature_ns, "X509Data"))
+    |> Enum.flat_map(&scoped_children(&1, @signature_ns, "X509Certificate"))
+    |> Enum.map(fn {node, _} -> node |> scalar_text() |> String.replace(~r/\s+/, "") end)
+    |> Enum.uniq()
+  end
+
+  defp validated_signing_certs(role) do
+    case role_certs(role, :signing) do
+      [] ->
+        {:error, :missing_signing_certificate}
+
+      certs ->
+        if Enum.all?(certs, &valid_signing_cert?/1) do
+          {:ok, certs}
+        else
+          {:error, :invalid_signing_certificate}
+        end
+    end
+  end
+
+  defp valid_signing_cert?(encoded) do
+    with {:ok, der} <- Base.decode64(encoded),
+         {:ok, _key} <- Key.certificate_public_key(der) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp scalar_text({_, _, children}) do
+    if Enum.all?(children, &is_binary/1) do
+      children |> IO.iodata_to_binary() |> String.trim()
+    else
+      ""
+    end
+  end
+
+  defp endpoints(role) do
+    with {:ok, sso_redirect} <- role_url(role, "SingleSignOnService", @redirect),
+         {:ok, sso_post} <- role_url(role, "SingleSignOnService", @post),
+         {:ok, slo_redirect} <- role_url(role, "SingleLogoutService", @redirect),
+         {:ok, slo_post} <- role_url(role, "SingleLogoutService", @post),
+         true <- is_binary(sso_redirect) or is_binary(sso_post) do
+      {:ok, %{sso_redirect: sso_redirect, sso_post: sso_post, slo_redirect: slo_redirect, slo_post: slo_post}}
+    else
+      _ -> {:error, :invalid_metadata_endpoints}
+    end
+  end
+
+  defp role_url(role, service, binding) do
+    role
+    |> scoped_children(@metadata_ns, service)
+    |> Enum.filter(fn {node, _} -> XML.attribute(node, "Binding") == binding end)
+    |> case do
+      [] ->
+        {:ok, nil}
+
+      [{node, _}] ->
+        url = XML.attribute(node, "Location")
+
+        if valid_url?(url, :endpoint) do
+          {:ok, url}
+        else
+          {:error, :invalid_endpoint}
+        end
+
+      _ ->
+        {:error, :ambiguous_endpoint}
+    end
+  end
+
+  defp key_for_purpose?(node, :encryption), do: XML.attribute(node, "use") in [nil, "encryption"]
+  defp key_for_purpose?(node, :signing), do: XML.attribute(node, "use") in [nil, "signing"]
+
+  defp valid_url?(url, kind), do: Samly.URL.valid?(url, kind)
+  defp safe_url_text?(url), do: String.valid?(url) and not Regex.match?(~r/[\x00-\x20\x7f\\]/, url)
 end

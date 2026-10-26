@@ -98,7 +98,7 @@ defmodule SamlyIdpDataTest do
     assert idp_data.signed_envelopes_in_resp
   end
 
-  test "valid-idp-config-4", %{sps: sps} do
+  test "invalid-idp-config-with-both-incoming-signatures-disabled", %{sps: sps} do
     idp_config =
       Map.merge(@idp_config1, %{
         use_redirect_for_req: true,
@@ -114,6 +114,7 @@ defmodule SamlyIdpDataTest do
     refute idp_data.sign_metadata
     refute idp_data.signed_assertion_in_resp
     refute idp_data.signed_envelopes_in_resp
+    refute idp_data.valid?
   end
 
   test "valid-idp-config-5", %{sps: sps} do

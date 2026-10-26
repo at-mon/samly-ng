@@ -4,6 +4,11 @@ defmodule Samly.Application do
 
   @impl true
   def start(_type, _args) do
-    Supervisor.start_link([Samly.ReplayCache.ETS], strategy: :one_for_one, name: Samly.Supervisor)
+    children = [
+      Samly.ReplayCache.ETS,
+      %{id: Samly.State.Supervisor, start: {Supervisor, :start_link, [[], [strategy: :one_for_one, name: Samly.State.Supervisor]]}, type: :supervisor}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: Samly.Supervisor)
   end
 end

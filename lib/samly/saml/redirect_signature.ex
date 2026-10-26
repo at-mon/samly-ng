@@ -10,7 +10,13 @@ defmodule Samly.SAML.RedirectSignature do
 
   @spec verify(binary(), binary(), [binary()], keyword()) :: :ok | {:error, atom()}
   def verify(query, message_type, certificates, opts \\ []) do
+    with {:ok, _params} <- verify_and_decode(query, message_type, certificates, opts), do: :ok
+  end
+
+  @doc false
+  def verify_and_decode(query, message_type, certificates, opts \\ []) do
     with {:ok, params} <- parse_raw_query(query),
+         :ok <- validate_message_type(params, message_type),
          {:ok, message} <- fetch(params, message_type),
          {:ok, algorithm_raw} <- fetch(params, "SigAlg"),
          {:ok, signature_raw} <- fetch(params, "Signature"),
@@ -18,7 +24,7 @@ defmodule Samly.SAML.RedirectSignature do
          {:ok, signature} <- signature_raw |> decode() |> Base.decode64(),
          signed = signed_octets(message_type, message, params["RelayState"], algorithm_raw),
          true <- Enum.any?(certificates, &verifies?(&1, signed, hash, signature)) do
-      :ok
+      {:ok, Map.new(params, fn {key, value} -> {key, decode(value)} end)}
     else
       false -> {:error, :bad_redirect_signature}
       :error -> {:error, :bad_redirect_signature}
@@ -35,12 +41,19 @@ defmodule Samly.SAML.RedirectSignature do
       [key | value] = String.split(pair, "=", parts: 2)
       decoded_key = decode(key)
 
-      if Map.has_key?(params, decoded_key) do
-        {:halt, {:error, :duplicate_query_parameter}}
-      else
-        {:cont, {:ok, Map.put(params, decoded_key, List.first(value) || "")}}
+      cond do
+        String.contains?(decoded_key, ["[", "]"]) -> {:halt, {:error, :invalid_query_parameter}}
+        Map.has_key?(params, decoded_key) -> {:halt, {:error, :duplicate_query_parameter}}
+        true -> {:cont, {:ok, Map.put(params, decoded_key, List.first(value) || "")}}
       end
     end)
+  end
+
+  defp validate_message_type(params, type) when type in ["SAMLRequest", "SAMLResponse"] do
+    case Enum.filter(["SAMLRequest", "SAMLResponse"], &Map.has_key?(params, &1)) do
+      [^type] -> :ok
+      _ -> {:error, :ambiguous_saml_message}
+    end
   end
 
   defp signed_octets(type, message, nil, algorithm), do: "#{type}=#{message}&SigAlg=#{algorithm}"

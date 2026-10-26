@@ -1,6 +1,6 @@
 # Phoenix setup and production guide
 
-[README](../README.md) · [Configuration reference](configuration.md) · [Security review](../SECURITY_REVIEW.md)
+[README](../README.md) · [Configuration reference](configuration.md) · [Security review](SECURITY_REVIEW.md)
 
 This guide describes this checkout's Samly 2 implementation, not the older published Samly 1.x behavior.
 Examples use the Phoenix application `:my_app`, endpoint `MyAppWeb.Endpoint`, SP ID `web`, and IdP ID `workforce`.
@@ -14,7 +14,7 @@ These requirements are not satisfied simply by adding the dependency.
 
 | Requirement | What you must do |
 | --- | --- |
-| Patched runtime | Use Elixir 1.20.x and a maintained, security-patched OTP release; the review's minimum patched versions are 27.3.4.17, 28.5.0.6, or 29.0.6 on their respective release lines. |
+| Patched runtime | Use Elixir 1.20.x and a maintained, security-patched OTP release; the review's minimum patched versions are 27.3.4.18, 28.5.0.7, or 29.1.1 on their respective release lines. |
 | Stable public identity | Set an explicit SP `entity_id` and absolute HTTPS IdP `base_url`, including the mounted path, without a trailing slash. |
 | Trusted metadata | Obtain IdP metadata through an authenticated administrator workflow or TLS-verified source; verify its entity ID, endpoints, and signing certificates out of band. |
 | SP credentials | Configure readable PEM `certfile` and matching RSA `keyfile`; protect the private key and register the certificate with the IdP. |
@@ -24,13 +24,17 @@ These requirements are not satisfied simply by adding the dependency.
 | Session secrets | Supply a strong `secret_key_base`; use an encrypted cookie or server-side session store for sensitive contents; share required secrets consistently across replicas. |
 | Correct endpoint order | Body parsers and `Plug.Session` must precede Samly; Samly must precede the application router. |
 | CSRF boundary | Keep Phoenix CSRF protection on application routes; do not put IdP callback endpoints through Phoenix's browser CSRF pipeline. |
-| Replay protection | For cache restart safety or multiple nodes, deploy a durable shared atomic `Samly.ReplayCache` implementation; an assertion store is not a replay store. |
+| Replay protection | For cache restart safety or multiple nodes, deploy a durable shared `Samly.ReplayCache` with atomic `consume_many/1`; coordinate namespace migration or quiescence before upgrading. |
+| Session revocation | Use opaque per-login assertion keys and an authoritative shared store for cross-node or cookie-less logout; cookie-backed assertion state cannot revoke copied cookies. |
+| Diagnostic controls | Keep raw diagnostics disabled normally; restrict access and retention during explicit per-IdP or CSP debugging windows. |
 | Authorization | Map a trusted IdP-scoped identity to your application's user and permissions; successful SAML login is not administrative authorization. |
 | Infrastructure limits | Bound request bodies and request rates, reject unexpected public Hosts, protect proxy headers, synchronize clocks, and avoid logging SAML payloads or secrets. |
 | Deployment validation | Test real login, logout, certificate rollover, replay rejection, expiry, proxy URLs, cookies, and multi-node behavior before production traffic. |
 
-The [security review](../SECURITY_REVIEW.md) records coverage and interoperability gaps.
+The [security review](SECURITY_REVIEW.md) records coverage and interoperability gaps.
+Independent signature, canonicalization, and encryption cases supplement HTTP regressions but are not comprehensive production assurance.
 The older implementation's history with a particular IdP is not evidence that the rewritten implementation has been tested with that IdP.
+Upgrading an existing deployment also requires the [session and replay cutover](MIGRATION.md) procedures; do not accept SAML on mixed old and new versions.
 
 ## 1. Install this implementation and choose Bandit
 
@@ -82,6 +86,10 @@ Export the IdP's XML metadata and store it at a known absolute path, for example
 Samly reads a file or inline XML; it does not fetch metadata URLs or periodically refresh remote metadata.
 Never bypass TLS certificate verification when acquiring production trust metadata.
 Use a single intended IdP entity document rather than relying on selection from an aggregate federation document.
+The loader requires exactly one eligible SAML 2.0 IdP role, and rejects ambiguous entities/roles, invalid signing certificates, duplicate service/binding endpoints, and mismatched SP RSA key pairs.
+Only signing-capable keys within the selected role contribute trust; unrelated SP roles, extensions, and encryption-only keys do not.
+Rollover certificates must belong to the selected IdP role.
+Use reviewed HTTP(S) endpoint URLs without userinfo, fragments, control characters, backslashes, or malformed escapes; base and callback URLs must also omit query strings.
 
 ## 3. Configure Samly at runtime
 
@@ -113,6 +121,7 @@ config :samly, Samly.Provider,
       signed_envelopes_in_resp: true,
       allow_idp_initiated_flow: false,
       allow_legacy_sha1: false,
+      debug_mode: false,
       allowed_target_urls: []
     }
   ]
@@ -150,8 +159,12 @@ An explicit equivalent is:
 ```elixir
 config :samly, Samly.State,
   store: Samly.State.ETS,
-  opts: [table: :samly_assertions_table]
+  opts: [table: :samly_assertions_table, max_entries: 10_000, cleanup_interval_ms: 60_000]
 ```
+
+A supervised owner manages the protected table, prunes expired entries, and rejects writes at capacity without evicting live sessions.
+Owner or node restarts discard these sessions; ETS is not a durable or cluster-wide store.
+Built-in stores enforce subject expiry and any earlier authentication-session expiry, not just the host cookie lifetime.
 
 The alternative puts assertions in the existing Plug session:
 
@@ -162,9 +175,15 @@ config :samly, Samly.State,
 ```
 
 With cookie sessions, large assertions can exceed browser cookie limits, and copied cookies cannot be centrally revoked by deleting another browser's cookie.
+The Session adapter is stateless: cookie-less IdP logout cannot revoke assertions held by other browsers.
 Do not choose the cookie-backed assertion store solely because the deployment has multiple nodes.
-Prefer a shared server-side assertion store for central revocation, large assertions, or cross-browser IdP logout.
-Built-in stores key assertions by `{idp_id, name_id}`, not a unique browser session; assess concurrent logins for the same subject.
+Prefer an authoritative shared server-side assertion store for central revocation, large assertions, or cross-browser/cross-node IdP logout.
+
+Authentication stores `"samly_session"` as `{:v1, idp_id, random_session_id}` and keys assertions by `{idp_id, random_session_id}`.
+The second key component is opaque, not a NameID, so concurrent logins for one subject remain independent.
+Legacy browser-session entries require reauthentication; custom stores must migrate any schema or logic that assumed NameID keys.
+For IdP logout, implement `revoke_assertions/3` using the qualified subject and optional SessionIndex selector described in the [configuration reference](configuration.md#assertion-state-settings).
+Revocation must be atomic and work without a browser cookie; a missing callback fails explicitly rather than claiming success.
 
 For durable replay protection, implement and deploy a module before configuring it:
 
@@ -173,10 +192,15 @@ For durable replay protection, implement and deploy a module before configuring 
 config :samly, :replay_cache, MyApp.SAML.ReplayCache
 ```
 
-`consume(key, expires_at)` receives a 32-byte SHA-256 binary key and a `DateTime` expiry already including acceptance clock skew.
-Atomically return `:ok` exactly once, return `{:error, :replayed}` for duplicates, retain entries until expiry, and fail closed on failures.
-Use an atomic conditional insert or transaction; separate read-then-write operations are unsafe.
+`consume_many([{key, expires_at}])` receives 32-byte SHA-256 binary keys and `DateTime` expiries already including acceptance clock skew.
+Atomically accept the entire batch exactly once or reject it without inserting any entries; duplicates return `{:error, :replayed}`.
+Retain entries until expiry and fail closed on backend, capacity, or transaction failures.
+Use a single atomic transaction or conditional batch operation, not a loop of independent inserts.
+The older `consume(key, expires_at)` callback is a singleton fallback only; a multi-entry response requires `consume_many/1`.
 Preserve history through cache-process and VM restarts, and use the same backend and namespace on every node.
+Replay keys now use authenticated identifiers and stable SP/IdP trust identities serialized as a versioned tuple before hashing, not certificate identity.
+Because the namespace changed, upgrades must migrate still-live replay history or quiesce acceptance on all nodes for at least the maximum remaining old assertion lifetime plus clock skew.
+Do not run mixed versions accepting SAML; follow the [coordinated cutover instructions](MIGRATION.md#replay-storage-and-coordinated-cutover).
 Samly does not start your custom storage clients or supply a Redis/database adapter.
 
 ## 5. Start the provider before the endpoint
@@ -192,8 +216,9 @@ children = [
 ]
 ```
 
-The Samly OTP application starts its built-in replay-cache supervisor automatically.
-Do not add a second Samly application supervisor or default replay-cache child.
+The Samly OTP application starts its built-in replay cache and assertion-store supervisor automatically.
+Provider initialization starts the selected ETS assertion owner under that supervisor.
+Do not add a second Samly application supervisor, default replay-cache child, or manually owned assertion table.
 Provider configuration is application-wide; several differently configured providers in one BEAM are not isolated.
 
 Invalid providers may be logged and omitted rather than failing application startup.
@@ -388,10 +413,23 @@ Coordinate IdP and SP signing-certificate rollover before retiring old trust mat
 | Audience/destination rejection | Exact entity ID, ACS URL, proxy origin, trailing slashes, and IdP registration. |
 | Signature rejection | Trusted metadata, rollover certificates, SHA-256, and supported canonicalization; do not disable checks as a workaround. |
 | Replay/cache error | Duplicate submissions, cache availability/capacity, and shared-store consistency. |
-| Immediate expiry | Clock synchronization and IdP validity windows; built-in stores use subject expiry, not cookie lifetime alone. |
+| Immediate expiry | Clock synchronization, subject validity, and any earlier authentication-session deadline; cookie lifetime alone does not extend them. |
+| New logins fail at capacity | Assertion-store capacity and expiry cleanup, replay-store capacity, and backend availability; do not evict live replay history to recover space. |
 | Logout fails | SLO binding, issuer/destination, request correlation, SessionIndex, signature, and message age. |
 | Encryption fails | RSA-OAEP/AES-GCM compatibility, correct SP key, and independent testing of your IdP profile. |
 
-Protocol errors are operational diagnostics, not browser response content.
+Protocol errors are operational diagnostics, not raw browser response content.
+For a controlled diagnostic window, set `debug_mode: true` on the affected IdP and enable Logger's debug level, then refresh provider configuration.
+Requests without a resolved IdP never borrow another provider's flag, and nonboolean values such as `"true"` do not enable raw logging.
+Raw SAML, status-detail, and request/URL diagnostics retain content up to an 8000-byte message bound, mark truncation, and safely escape invalid bytes.
+These logs can contain personal information and replayable assertions; restrict access and retention, then disable the flag and refresh again immediately after diagnosis.
+Private keys, cookie secrets, whole connection/configuration structs, and OTP status/crash state remain excluded regardless of debugging flags.
+
+CSP reports have an independent opt-in, `config :samly, :debug_csp_reports, true`, because they have no IdP context.
+The endpoint accepts only POST and reads at most a 16 KiB application body chunk with bounded socket reads; oversized or failed reports are rejected without reflecting content.
+Debugging can emit a bounded partial report, but raw report content is absent by default.
+Retain host and proxy request limits even when diagnostic flags are disabled.
+
 Run this repository's quality gates and the host application's own tests and security scanners; Samly's development dependencies are not inherited by consumers.
-Include real browser/IdP and multi-node replay tests in release acceptance rather than relying solely on self-generated signatures.
+Include real browser/IdP and multi-node replay tests in release acceptance rather than relying solely on self-generated signatures or the independent reference cases.
+Test the supported strict XML/canonicalization/encryption profile with your IdP instead of disabling checks to accept ambiguous or unsupported messages.

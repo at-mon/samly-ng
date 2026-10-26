@@ -42,6 +42,7 @@ defmodule Samly.RouterUtil do
 
   def check_target_url(conn, _opts) do
     target_url = target_url_param(conn)
+    Samly.Diagnostics.raw(conn.private[:samly_idp], :target_url, target_url)
 
     if valid_target_url?(target_url, conn.private[:samly_idp]) do
       Conn.put_private(conn, :samly_target_url, target_url)
@@ -50,7 +51,7 @@ defmodule Samly.RouterUtil do
     end
   rescue
     ArgumentError ->
-      Logger.error("[Samly] target_url must be x-www-form-urlencoded: #{inspect(conn.params["target_url"])}")
+      Logger.warning("[Samly] Invalid target URL encoding")
 
       conn |> Conn.send_resp(400, "target_url must be x-www-form-urlencoded") |> Conn.halt()
   end
@@ -66,7 +67,7 @@ defmodule Samly.RouterUtil do
   def valid_target_url?(nil, _idp), do: true
 
   def valid_target_url?(target, %IdpData{allowed_target_urls: allowed}) when is_binary(target) do
-    not Regex.match?(~r/[\x00-\x20\x7f\\]/, target) and
+    Samly.URL.valid?(target, :target) and
       (safe_relative_target?(target) or target in (allowed || []))
   end
 
@@ -102,12 +103,11 @@ defmodule Samly.RouterUtil do
   end
 
   defp validate_external_base_url!(base_url) do
-    case URI.parse(base_url) do
-      %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) ->
-        String.trim_trailing(base_url, "/")
-
-      _ ->
-        raise ArgumentError, ":external_base_url must be an absolute HTTP or HTTPS URL"
+    with true <- Samly.URL.valid?(base_url, :base),
+         {:ok, %URI{scheme: scheme}} when scheme in ["http", "https"] <- URI.new(base_url) do
+      String.trim_trailing(base_url, "/")
+    else
+      _ -> raise ArgumentError, ":external_base_url must be an absolute HTTP or HTTPS URL without userinfo, query or fragment"
     end
   end
 

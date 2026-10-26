@@ -1,17 +1,21 @@
 defmodule Samly.SAML.XML do
   @moduledoc false
 
+  alias Samly.SAML.XML.Lexical
+  alias Samly.SAML.XML.Namespaces
+
   @default_max_bytes 1_048_576
-  @forbidden_tokens ["<!DOCTYPE", "<!ENTITY"]
 
   @type xml_node :: {binary(), [{binary(), binary()}], [xml_node() | binary()]}
 
   @spec parse(binary(), keyword()) :: {:ok, xml_node()} | {:error, atom()}
-  def parse(xml, opts \\ []) when is_binary(xml) do
+  def parse(xml, opts \\ [])
+
+  def parse(xml, opts) when is_binary(xml) do
     max_bytes = Keyword.get(opts, :max_bytes, @default_max_bytes)
 
     with :ok <- validate_size(xml, max_bytes),
-         :ok <- reject_entities(xml),
+         {:ok, xml} <- Lexical.prepare(xml),
          {:ok, tree} <- parse_bounded(xml) do
       {:ok, tree}
     else
@@ -22,8 +26,10 @@ defmodule Samly.SAML.XML do
     ArgumentError -> {:error, :invalid_xml}
   end
 
+  def parse(_xml, _opts), do: {:error, :invalid_xml}
+
   @spec encode(xml_node()) :: binary()
-  def encode(node), do: node |> to_xml_builder() |> XmlBuilder.generate(format: :none)
+  def encode(node), do: node |> encode_node() |> IO.iodata_to_binary()
 
   @spec local_name(binary()) :: binary()
   def local_name(name) do
@@ -74,18 +80,74 @@ defmodule Samly.SAML.XML do
     |> String.trim()
   end
 
+  @doc false
+  @spec element_children(xml_node()) :: [xml_node()]
+  def element_children({_name, _attributes, children}), do: Enum.filter(children, &is_tuple/1)
+
+  @doc false
+  @spec exactly_one_child(xml_node(), binary()) :: {:ok, xml_node()} | {:error, atom()}
+  def exactly_one_child(node, wanted) do
+    case children(node, wanted) do
+      [child] -> {:ok, child}
+      [] -> {:error, :missing_element}
+      _ -> {:error, :ambiguous_element}
+    end
+  end
+
+  @doc false
+  @spec optional_child(xml_node(), binary()) :: {:ok, xml_node() | nil} | {:error, atom()}
+  def optional_child(node, wanted) do
+    case children(node, wanted) do
+      [child] -> {:ok, child}
+      [] -> {:ok, nil}
+      _ -> {:error, :ambiguous_element}
+    end
+  end
+
+  @doc false
+  @spec scalar_text(xml_node()) :: {:ok, binary()} | {:error, :non_scalar_text}
+  def scalar_text({_name, _attributes, children}) do
+    if Enum.all?(children, &is_binary/1) do
+      {:ok, IO.iodata_to_binary(children)}
+    else
+      {:error, :non_scalar_text}
+    end
+  end
+
+  @doc false
+  @spec in_scope_namespaces(xml_node(), map()) :: map()
+  def in_scope_namespaces({_name, attributes, _children}, inherited \\ %{}), do: Namespaces.in_scope(attributes, inherited)
+
+  @doc false
+  @spec expanded_name(xml_node(), map()) :: {binary(), binary()}
+  def expanded_name({name, _attributes, _children} = node, inherited \\ %{}), do: Namespaces.expanded_name(name, in_scope_namespaces(node, inherited))
+
+  @doc false
+  @spec namespace_context(xml_node(), xml_node()) :: {:ok, map()} | {:error, :node_not_found}
+  def namespace_context(document, target), do: find_namespace_context(document, target, %{})
+
+  defp find_namespace_context(node, target, inherited) when node == target, do: {:ok, inherited}
+
+  defp find_namespace_context(node, target, inherited) do
+    available = in_scope_namespaces(node, inherited)
+
+    node
+    |> element_children()
+    |> Enum.reduce_while({:error, :node_not_found}, fn child, _acc ->
+      case find_namespace_context(child, target, available) do
+        {:ok, _} = found -> {:halt, found}
+        error -> {:cont, error}
+      end
+    end)
+  end
+
   defp node_name({name, _, _}), do: local_name(name)
 
   @doc false
   def valid_namespaces?(node, vocabulary, inherited \\ %{})
 
   def valid_namespaces?({name, attrs, children}, vocabulary, inherited) do
-    namespaces =
-      Enum.reduce(attrs, inherited, fn
-        {"xmlns", uri}, acc -> Map.put(acc, "", uri)
-        {"xmlns:" <> prefix, uri}, acc -> Map.put(acc, prefix, uri)
-        _, acc -> acc
-      end)
+    namespaces = Namespaces.in_scope(attrs, inherited)
 
     {prefix, local} =
       case String.split(name, ":", parts: 2) do
@@ -102,9 +164,9 @@ defmodule Samly.SAML.XML do
   def valid_namespaces?(text, _vocabulary, _inherited) when is_binary(text), do: true
 
   defp parse_bounded(xml) do
-    case Saxy.parse_string(xml, Samly.SAML.XML.Handler, {[], 0, 0}) do
+    case Saxy.parse_string(xml, Samly.SAML.XML.Handler, {[], 0, 0, [%{}]}) do
       {:ok, {:error, reason}} -> {:error, reason}
-      {:ok, {tree, 0, _count}} -> {:ok, tree}
+      {:ok, {tree, 0, _count, _contexts}} -> {:ok, tree}
       {:error, _reason} = error -> error
     end
   end
@@ -112,19 +174,32 @@ defmodule Samly.SAML.XML do
   defp validate_size(xml, max_bytes) when byte_size(xml) <= max_bytes, do: :ok
   defp validate_size(_xml, _max_bytes), do: {:error, :xml_too_large}
 
-  defp reject_entities(xml) do
-    upper = String.upcase(xml)
-
-    if Enum.any?(@forbidden_tokens, &String.contains?(upper, &1)) do
-      {:error, :xml_entities_not_allowed}
-    else
-      :ok
-    end
+  # XmlBuilder emits literal attribute whitespace and text CRs, which change
+  # meaning on a subsequent XML parse. Escape those as character references.
+  defp encode_node({name, attributes, children}) do
+    attrs = Enum.map(attributes, fn {name, value} -> [" ", encode_name!(name), "=\"", escape_attribute(value), "\""] end)
+    ["<", encode_name!(name), attrs, ">", Enum.map(children, &encode_node/1), "</", name, ">"]
   end
 
-  defp to_xml_builder({name, attributes, children}) do
-    {name, attributes, Enum.map(children, &to_xml_builder/1)}
+  defp encode_node(text) when is_binary(text), do: escape_text(text)
+
+  defp encode_name!(name) do
+    if Regex.match?(~r/\A[\p{L}_:][\p{L}\p{N}_.:\-]*\z/u, name), do: name, else: raise(ArgumentError, "invalid XML name")
   end
 
-  defp to_xml_builder(text) when is_binary(text), do: text
+  defp escape_text(text) do
+    text
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+    |> String.replace("\r", "&#xD;")
+  end
+
+  defp escape_attribute(value) do
+    value
+    |> escape_text()
+    |> String.replace("\"", "&quot;")
+    |> String.replace("\t", "&#x9;")
+    |> String.replace("\n", "&#xA;")
+  end
 end

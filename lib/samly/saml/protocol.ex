@@ -97,6 +97,14 @@ defmodule Samly.SAML.Protocol do
   end
 
   def decode_authn_response(xml, sp) do
+    with {:ok, assertion, replay_entries} <- verify_authn_response(xml, sp),
+         :ok <- ReplayCache.consume_many(replay_entries) do
+      {:ok, assertion}
+    end
+  end
+
+  @doc false
+  def verify_authn_response(xml, sp) do
     with {:ok, root} <- XML.parse(xml),
          :ok <- root_named(root, "Response"),
          :ok <- require_authentication(sp),
@@ -109,10 +117,10 @@ defmodule Samly.SAML.Protocol do
          :ok <- validate_destination(root, sp),
          :ok <- validate_issuer(root, sp),
          :ok <- validate_issuer(assertion_node, sp),
-         :ok <- validate_assertion(assertion_node, sp),
-         :ok <- validate_response_correlation(root, assertion_node, sp),
-         :ok <- prevent_replay(root, assertion_node, sp) do
-      {:ok, build_assertion(assertion_node, sp)}
+         {:ok, confirmation} <- valid_bearer_confirmation(assertion_node, to_string(Esaml.esaml_sp(sp, :consume_uri)), XML.attribute(root, "InResponseTo") || ""),
+         :ok <- validate_assertion(assertion_node, sp, confirmation),
+         {:ok, entries} <- replay_entries(root, assertion_node, sp) do
+      {:ok, build_assertion(assertion_node, confirmation), entries}
     end
   end
 
@@ -120,39 +128,78 @@ defmodule Samly.SAML.Protocol do
     if sp_flag(sp, :idp_signs_envelopes) or sp_flag(sp, :idp_signs_assertions), do: :ok, else: {:error, :unsigned_assertions_disabled}
   end
 
-  defp validate_response_correlation(root, assertion, sp) do
-    {:ok, confirmation} = valid_bearer_confirmation(assertion, to_string(Esaml.esaml_sp(sp, :consume_uri)))
-    response_to = XML.attribute(root, "InResponseTo") || ""
-    confirmation_to = XML.attribute(confirmation, "InResponseTo") || ""
-    if response_to == confirmation_to, do: :ok, else: {:error, :invalid_in_response_to}
-  end
-
-  def decode_logout_response(xml, sp) do
-    with {:ok, root} <- XML.parse(xml),
-         :ok <- root_named(root, "LogoutResponse"),
-         :ok <- verify_if_required(root, root, sp, :idp_signs_logout_requests),
-         :ok <- success_status(root),
-         :ok <- validate_logout(root, sp) do
-      {:ok, Esaml.esaml_logoutresp(status: :success, in_response_to: XML.attribute(root, "InResponseTo") || "")}
+  def decode_logout_response(xml, sp, verification \\ []) do
+    with {:ok, response, replay_entries} <- verify_logout_response(xml, sp, verification),
+         :ok <- ReplayCache.consume_many(replay_entries) do
+      {:ok, response}
     end
   end
 
-  def decode_logout_request(xml, sp) do
+  @doc false
+  def verify_logout_response(xml, sp, verification \\ []) do
+    with {:ok, root} <- XML.parse(xml),
+         :ok <- root_named(root, "LogoutResponse"),
+         :ok <- verify_logout(root, sp, verification),
+         :ok <- success_status(root),
+         {:ok, replay_entries} <- logout_replay_entries(root, sp) do
+      response = Esaml.esaml_logoutresp(status: :success, in_response_to: XML.attribute(root, "InResponseTo") || "")
+      {:ok, response, replay_entries}
+    end
+  end
+
+  def decode_logout_request(xml, sp, verification \\ []) do
     with {:ok, root} <- XML.parse(xml),
          :ok <- root_named(root, "LogoutRequest"),
-         :ok <- verify_if_required(root, root, sp, :idp_signs_logout_requests),
+         :ok <- verify_logout(root, sp, verification),
+         [name_node] <- XML.children(root, "NameID"),
+         {:ok, name} <- scalar(name_node),
+         true <- String.trim(name) != "",
+         {:ok, indexes} <- logout_indexes(root),
          :ok <- validate_logout(root, sp) do
       {:ok,
        Esaml.esaml_logoutreq(
          id: XML.attribute(root, "ID"),
-         name: root |> first("NameID") |> XML.text() |> to_charlist(),
-         issuer: root |> first("Issuer") |> XML.text() |> to_charlist(),
-         session_index: root |> first("SessionIndex") |> XML.text() |> to_charlist()
+         name: to_charlist(name),
+         name_format: optional_charlist(XML.attribute(name_node, "Format")),
+         name_qualifier: optional_charlist(XML.attribute(name_node, "NameQualifier")),
+         sp_name_qualifier: optional_charlist(XML.attribute(name_node, "SPNameQualifier")),
+         issuer: root |> XML.child("Issuer") |> XML.text() |> to_charlist(),
+         session_index: indexes |> List.first("") |> to_charlist(),
+         session_indexes: indexes
        )}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_logout_structure}
     end
   end
 
+  defp verify_logout(_root, _sp, redirect_verified: true), do: :ok
+
+  defp verify_logout(root, sp, _verification) do
+    XMLDSig.verify(root, root, Esaml.esaml_sp(sp, :trusted_fingerprints), allow_legacy_sha1: Esaml.esaml_sp(sp, :allow_legacy_sha1))
+  end
+
+  defp optional_charlist(nil), do: :undefined
+  defp optional_charlist(value), do: to_charlist(value)
+
+  defp logout_indexes(root) do
+    root
+    |> XML.children("SessionIndex")
+    |> Enum.reduce_while({:ok, []}, fn node, {:ok, values} ->
+      case scalar(node) do
+        {:ok, value} when value != "" -> {:cont, {:ok, [value | values]}}
+        _ -> {:halt, {:error, :invalid_logout_structure}}
+      end
+    end)
+  end
+
   defp validate_logout(root, sp) do
+    with {:ok, replay_entries} <- logout_replay_entries(root, sp) do
+      ReplayCache.consume_many(replay_entries)
+    end
+  end
+
+  defp logout_replay_entries(root, sp) do
     with :ok <- validate_issuer(root, sp),
          true <- XML.attribute(root, "Destination") == optional_string(Esaml.esaml_sp(sp, :logout_uri)),
          {:ok, issued, _} <- DateTime.from_iso8601(XML.attribute(root, "IssueInstant") || ""),
@@ -160,7 +207,7 @@ defmodule Samly.SAML.Protocol do
          true <- age >= -120 and age < 420,
          :ok <- after_or_missing(DateTime.utc_now(), XML.attribute(root, "NotOnOrAfter")),
          id when is_binary(id) and id != "" <- XML.attribute(root, "ID") do
-      ReplayCache.consume("logout:" <> id, DateTime.shift(issued, minute: 7))
+      {:ok, [{replay_key(sp, XML.local_name(elem(root, 0)), id), DateTime.shift(issued, minute: 7)}]}
     else
       {:error, :invalid_issuer} = error ->
         error
@@ -222,9 +269,9 @@ defmodule Samly.SAML.Protocol do
   defp root_named({name, _, _} = root, wanted) do
     vocabulary =
       Map.merge(
-        Map.new(~w(Response LogoutResponse LogoutRequest Status StatusCode StatusMessage StatusDetail), &{&1, @protocol_ns}),
+        Map.new(~w(Response LogoutResponse LogoutRequest SessionIndex Status StatusCode StatusMessage StatusDetail), &{&1, @protocol_ns}),
         Map.new(
-          ~w(Assertion EncryptedAssertion Issuer Subject NameID SubjectConfirmation SubjectConfirmationData Conditions AudienceRestriction Audience AttributeStatement Attribute AttributeValue AuthnStatement AuthnContext AuthnContextClassRef),
+          ~w(Assertion EncryptedAssertion Issuer Subject NameID SubjectConfirmation SubjectConfirmationData Conditions AudienceRestriction Audience OneTimeUse ProxyRestriction AttributeStatement Attribute AttributeValue AuthnStatement AuthnContext AuthnContextClassRef),
           &{&1, @assertion_ns}
         )
       )
@@ -236,20 +283,51 @@ defmodule Samly.SAML.Protocol do
   defp assertion_structure(assertion) do
     with "2.0" <- XML.attribute(assertion, "Version"),
          [subject] <- XML.children(assertion, "Subject"),
-         [_name] <- XML.children(subject, "NameID"),
-         [_conditions] <- XML.children(assertion, "Conditions"),
-         [_issuer] <- XML.children(assertion, "Issuer") do
+         [name] <- XML.children(subject, "NameID"),
+         {:ok, identity} <- scalar(name),
+         true <- String.trim(identity) != "",
+         [conditions] <- XML.children(assertion, "Conditions"),
+         true <- supported_conditions?(conditions),
+         [_issuer] <- XML.children(assertion, "Issuer"),
+         [_ | _] = statements <- XML.children(assertion, "AuthnStatement"),
+         true <- Enum.all?(statements, &valid_authn_statement?/1),
+         {:ok, _issued, _} <- DateTime.from_iso8601(XML.attribute(assertion, "IssueInstant") || "") do
       :ok
     else
       _ -> {:error, :invalid_assertion_structure}
     end
   end
 
+  defp scalar(node), do: XML.scalar_text(node)
+
+  defp supported_conditions?({_name, _attrs, children}) do
+    Enum.all?(children, fn
+      text when is_binary(text) -> String.trim(text) == ""
+      {name, _, _} -> XML.local_name(name) in ["AudienceRestriction", "OneTimeUse", "ProxyRestriction"]
+    end)
+  end
+
+  defp valid_authn_statement?(statement) do
+    with {:ok, instant, _} <- DateTime.from_iso8601(XML.attribute(statement, "AuthnInstant") || ""),
+         true <- DateTime.diff(instant, DateTime.utc_now()) <= 120,
+         [context] <- XML.children(statement, "AuthnContext"),
+         [reference] <- XML.children(context, "AuthnContextClassRef"),
+         {:ok, value} <- scalar(reference),
+         true <- value != "",
+         :ok <- after_or_missing(DateTime.utc_now(), XML.attribute(statement, "SessionNotOnOrAfter")) do
+      true
+    else
+      _ -> false
+    end
+  end
+
   defp success_status(root) do
-    case root |> first("StatusCode") |> then(&if(&1, do: XML.attribute(&1, "Value"))) do
-      @success -> :ok
-      nil -> {:error, :missing_status}
-      status -> {:error, {:saml_error, status}}
+    with [status] <- XML.children(root, "Status"),
+         [code] <- XML.children(status, "StatusCode"),
+         @success <- XML.attribute(code, "Value") do
+      :ok
+    else
+      _ -> {:error, :saml_status_rejected}
     end
   end
 
@@ -262,7 +340,8 @@ defmodule Samly.SAML.Protocol do
         if Esaml.esaml_sp(sp, :encrypt_mandatory), do: {:error, :encryption_required}, else: {:ok, assertion, root}
 
       {[], [encrypted_assertion]} ->
-        with {:ok, assertion} <- Encryption.decrypt(encrypted_assertion, Esaml.esaml_sp(sp, :key)) do
+        with {:ok, context} <- XML.namespace_context(root, encrypted_assertion),
+             {:ok, assertion} <- Encryption.decrypt(encrypted_assertion, Esaml.esaml_sp(sp, :key), context) do
           {name, attrs, children} = root
           document = {name, attrs, replace_child(children, encrypted_assertion, assertion)}
           {:ok, assertion, document}
@@ -294,17 +373,20 @@ defmodule Samly.SAML.Protocol do
 
   defp validate_issuer(assertion, sp) do
     expected = sp |> Esaml.esaml_sp(:idp_entity_id) |> optional_string()
-    actual = assertion |> XML.child("Issuer") |> XML.text()
 
-    if expected not in [nil, ""] and actual == expected, do: :ok, else: {:error, :invalid_issuer}
+    with [issuer] <- XML.children(assertion, "Issuer"),
+         {:ok, actual} <- scalar(issuer),
+         true <- expected not in [nil, ""] and actual == expected do
+      :ok
+    else
+      _ -> {:error, :invalid_issuer}
+    end
   end
 
-  defp validate_assertion(assertion, sp) do
-    expected_recipient = sp |> Esaml.esaml_sp(:consume_uri) |> to_string()
+  defp validate_assertion(assertion, sp, confirmation) do
     expected_audience = entity_id(sp)
 
-    with {:ok, confirmation} <- valid_bearer_confirmation(assertion, expected_recipient),
-         :ok <- validate_audiences(assertion, expected_audience),
+    with :ok <- validate_audiences(assertion, expected_audience),
          :ok <- validate_unique_attributes(assertion) do
       validate_times(assertion, confirmation)
     end
@@ -320,18 +402,23 @@ defmodule Samly.SAML.Protocol do
     end
   end
 
-  defp valid_bearer_confirmation(assertion, expected_recipient) do
+  defp valid_bearer_confirmation(assertion, expected_recipient, response_to) do
     assertion
     |> XML.child("Subject")
     |> XML.children("SubjectConfirmation")
     |> Enum.find_value({:error, :invalid_subject_confirmation}, fn confirmation ->
-      data = confirmation |> XML.children("SubjectConfirmationData") |> List.first()
-
-      if attribute(confirmation, "Method") ==
-           "urn:oasis:names:tc:SAML:2.0:cm:bearer" and
-           attribute(data, "Recipient") == expected_recipient and
-           is_binary(attribute(data, "NotOnOrAfter")) do
+      with "urn:oasis:names:tc:SAML:2.0:cm:bearer" <- attribute(confirmation, "Method"),
+           [data] <- XML.children(confirmation, "SubjectConfirmationData"),
+           [^data] <- XML.element_children(confirmation),
+           [] <- XML.element_children(data),
+           ^expected_recipient <- attribute(data, "Recipient"),
+           true <- (attribute(data, "InResponseTo") || "") == response_to,
+           nil <- attribute(data, "NotBefore"),
+           expiry when is_binary(expiry) <- attribute(data, "NotOnOrAfter"),
+           :ok <- after_or_missing(DateTime.utc_now(), expiry) do
         {:ok, data}
+      else
+        _ -> nil
       end
     end)
   end
@@ -342,7 +429,8 @@ defmodule Samly.SAML.Protocol do
     valid? =
       restrictions != [] and
         Enum.all?(restrictions, fn restriction ->
-          restriction |> XML.children("Audience") |> Enum.any?(&(XML.text(&1) == expected))
+          audiences = XML.children(restriction, "Audience")
+          Enum.all?(audiences, &match?({:ok, _}, scalar(&1))) and Enum.any?(audiences, &(scalar(&1) == {:ok, expected}))
         end)
 
     if valid?, do: :ok, else: {:error, :invalid_audience}
@@ -353,16 +441,20 @@ defmodule Samly.SAML.Protocol do
     if length(names) == length(Enum.uniq(names)), do: :ok, else: {:error, :duplicate_attribute}
   end
 
-  defp prevent_replay(response, assertion, sp) do
-    with response_id when is_binary(response_id) and response_id != "" <-
-           XML.attribute(response, "ID"),
-         assertion_id when is_binary(assertion_id) and assertion_id != "" <-
-           XML.attribute(assertion, "ID"),
-         {:ok, confirmation} <- valid_bearer_confirmation(assertion, to_string(Esaml.esaml_sp(sp, :consume_uri))),
-         {:ok, expires_at} <- replay_expiry(confirmation),
-         :ok <- ReplayCache.consume("response:" <> response_id, expires_at),
-         :ok <- ReplayCache.consume("assertion:" <> assertion_id, expires_at) do
-      :ok
+  defp replay_entries(response, assertion, sp) do
+    with response_id when is_binary(response_id) and response_id != "" <- XML.attribute(response, "ID"),
+         assertion_id when is_binary(assertion_id) and assertion_id != "" <- XML.attribute(assertion, "ID"),
+         {:ok, expires_at} <- replay_expiry(assertion) do
+      assertion_entry = {replay_key(sp, :assertion, assertion_id), expires_at}
+
+      entries =
+        if sp_flag(sp, :idp_signs_envelopes) do
+          [{replay_key(sp, :response, response_id), expires_at}, assertion_entry]
+        else
+          [assertion_entry]
+        end
+
+      {:ok, entries}
     else
       nil -> {:error, :missing_message_id}
       "" -> {:error, :missing_message_id}
@@ -370,12 +462,27 @@ defmodule Samly.SAML.Protocol do
     end
   end
 
-  defp replay_expiry(confirmation) do
-    value = attribute(confirmation, "NotOnOrAfter")
+  defp replay_key(sp, kind, id) do
+    :erlang.term_to_binary({:samly_replay_v2, entity_id(sp), optional_string(Esaml.esaml_sp(sp, :idp_entity_id)), kind, id})
+  end
 
-    case value && DateTime.from_iso8601(value) do
-      {:ok, expires_at, _offset} -> {:ok, DateTime.shift(expires_at, minute: 2)}
-      _ -> {:error, :missing_replay_expiry}
+  defp replay_expiry(assertion) do
+    expiries =
+      assertion
+      |> XML.child("Subject")
+      |> XML.children("SubjectConfirmation")
+      |> Enum.filter(&(attribute(&1, "Method") == "urn:oasis:names:tc:SAML:2.0:cm:bearer"))
+      |> Enum.flat_map(&XML.children(&1, "SubjectConfirmationData"))
+      |> Enum.flat_map(fn data ->
+        case DateTime.from_iso8601(attribute(data, "NotOnOrAfter") || "") do
+          {:ok, expires, _} -> [expires]
+          _ -> []
+        end
+      end)
+
+    case expiries do
+      [] -> {:error, :missing_replay_expiry}
+      values -> {:ok, values |> Enum.max_by(&DateTime.to_unix(&1, :microsecond)) |> DateTime.shift(minute: 2)}
     end
   end
 
@@ -401,18 +508,19 @@ defmodule Samly.SAML.Protocol do
     end
   end
 
-  defp build_assertion(node, sp) do
+  defp build_assertion(node, confirmation) do
     subject_node = XML.child(node, "Subject")
     name_node = XML.child(subject_node, "NameID")
-    {:ok, confirmation} = valid_bearer_confirmation(node, to_string(Esaml.esaml_sp(sp, :consume_uri)))
+    {:ok, name} = scalar(name_node)
+    {:ok, issuer} = node |> XML.child("Issuer") |> scalar()
 
     %Assertion{
       version: XML.attribute(node, "Version") || "2.0",
       issue_instant: XML.attribute(node, "IssueInstant") || "",
       recipient: attribute(confirmation, "Recipient") || "",
-      issuer: node |> first("Issuer") |> XML.text(),
+      issuer: issuer,
       subject: %Subject{
-        name: XML.text(name_node),
+        name: name,
         name_qualifier: attribute(name_node, "NameQualifier") || :undefined,
         sp_name_qualifier: attribute(name_node, "SPNameQualifier") || :undefined,
         name_format: attribute(name_node, "Format") || :undefined,
@@ -453,13 +561,26 @@ defmodule Samly.SAML.Protocol do
   end
 
   defp authn(node) do
-    case XML.child(node, "AuthnStatement") do
-      nil -> %{}
-      statement -> %{"session_index" => XML.attribute(statement, "SessionIndex") || ""}
-    end
+    statements = XML.children(node, "AuthnStatement")
+    indexes = statements |> Enum.map(&XML.attribute(&1, "SessionIndex")) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+    expiries = statements |> Enum.map(&XML.attribute(&1, "SessionNotOnOrAfter")) |> Enum.reject(&is_nil/1)
+
+    expiration =
+      Enum.min_by(
+        expiries,
+        fn value ->
+          {:ok, timestamp, _} = DateTime.from_iso8601(value)
+          DateTime.to_unix(timestamp, :microsecond)
+        end,
+        fn -> nil end
+      )
+
+    maybe_session_expiration(%{"session_index" => List.first(indexes) || "", "session_indexes" => indexes}, expiration)
   end
 
-  defp first(node, name), do: node |> XML.descendants(name) |> List.first()
+  defp maybe_session_expiration(authn, nil), do: authn
+  defp maybe_session_expiration(authn, expiry), do: Map.put(authn, "session_not_on_or_after", expiry)
+
   defp attribute(nil, _name), do: nil
   defp attribute(node, name), do: XML.attribute(node, name)
 
@@ -501,6 +622,4 @@ defmodule Samly.SAML.Protocol do
   defp sp_flag(sp, :sp_sign_requests), do: Esaml.esaml_sp(sp, :sp_sign_requests)
   defp sp_flag(sp, :idp_signs_envelopes), do: Esaml.esaml_sp(sp, :idp_signs_envelopes)
   defp sp_flag(sp, :idp_signs_assertions), do: Esaml.esaml_sp(sp, :idp_signs_assertions)
-
-  defp sp_flag(sp, :idp_signs_logout_requests), do: Esaml.esaml_sp(sp, :idp_signs_logout_requests)
 end
